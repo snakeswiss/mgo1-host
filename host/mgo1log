@@ -1,0 +1,879 @@
+#!/usr/bin/env python3
+"""mgo1log: the daily log files of one bot, one PLAYABLE DOLL or the doll manager (docs/LOGS.md).
+
+  <cmd> | mgo1log --dir /var/log/mgo1host/bot1           every line to stdout (the journal) and to
+                                                         <dir>/<YYYY-MM-DD>.log (UTC days)
+  mgo1log --dir <dir> --note "text" [--level E|W|I]       one line of the launcher's own
+
+Each line: "<ISO time, UTC> <level> <text>", the level E (an error: a crash, a failure), W (a warning:
+stuck, given up, refused) or I. Beside each day's file, <day>.sum (JSON): its lines, errors,
+warnings, starts, crashes, first and last times. Days older than MGO1_LOG_KEEP_DAYS (31) go; past
+MGO1_LOG_CAP_MB (64) a day, only the errors and warnings are kept, and (v150-host beta 16) the ordinary lines a
+post-mortem needs (KEPT below: the launchers' and the manager's own, the Game Report's, the players', the virtual
+dolls' (and (beta 19) their live level's, a `VDOLL ADAPT:` line a doll a minute at most), the sessions', the screens' texts,
+the pace, a doll's activity, score and aim); past 4 times the cap, the errors and
+warnings only. The lines come masked (the launchers mask the accounts and passwords before this); nothing here adds
+any. Standard library only.
+
+(v150-host beta 16) The flood guard (a game wrote 5000 lines a second, one a wild memory address: the day's file at
+its cap in two minutes, the journal and the export full of them): a line's shape is its text with every number, decimal
+or hexadecimal, replaced by <n>. More than MGO1_LOG_BURST (200) lines of one shape within MGO1_LOG_BURST_SECONDS (10):
+the first 200 are written as they are, the next ones counted, and every 10 s while it lasts one line (a warning) says
+how many, with the first and the last line's own numbers:
+  mgo1log: 48211 more lines like "ps2: hardware read outside the emulated registers at <n> (<n>)" in 10 s, the first at
+  00:48:56.418 (10886a50 00000000), the last at 00:49:06.417 (108c5d40 00000000) (not written one by one)
+then, once the shape is quiet again (none of its lines for 10 s, or 200 at most in 10 s), `mgo1log: no more lines like
+"..." for 10 s (N not written one by one in M s): written one by one again`. A summary is written when the next line
+comes after its 10 s, or at the stream's end. The journal gets the same lines as the file. An error's shape is never
+summarised, no line changes place; MGO1_LOG_BURST=0: off.
+
+(v150-host beta 16) The crash reports (docs/CRASH_REPORTS.md). The stream keeps in memory the last MGO1_CRASH_LINES
+(4000) lines it handled, summaries in place of floods, whatever the day's cap kept out of its file. When the game ends
+badly, <dir>/crash/<YYYY-MM-DD_HHMMSS UTC>_<reason>.txt gets what ended, when, the version, the game's last status
+(state, game, round, players with their kinds, pace) and those lines; 2 MB at most (MGO1_CRASH_KB), 40 files a folder
+(MGO1_CRASH_KEEP) and 31 days, 6 an hour at most (MGO1_CRASH_HOURLY: a loop of crashes does not push the older ones out).
+How it knows the end (the launchers set these for the stream; none of them set: no report but the watchdog's):
+  MGO1_CRASH_EXIT     a file the launcher writes with the game's exit code before the pipe closes (70: crash70, above
+                      128: signal<N>, 0: no report, another: exit<N>); no such file at the end: stopped, no report
+  MGO1_CRASH_ENDS     the launcher's own codes, "2=lost 6=lost 3=" (code=reason, no reason: no report)
+  MGO1_CRASH_STATUS   the game's status.json; MGO1_CRASH_VERSION the VERSION file
+  <dir>/crash/.hung   the doll manager's request ({"name", "what"}), written just before it restarts a hung game: the
+                      stream's SIGTERM then writes the report under that name (reason hung)
+The game's code outside its memory (its first `ps2: hardware read|write outside ...` line, MGO1Loader/wildguard.h): the 200 lines
+before that line and the 100 from it are kept apart, and stand at the head of the report when the game wrote more than
+4000 lines since (the header's `wild:` line gives that first access); a game that ends with no failure after such an
+access leaves a report too (reason wild).
+"""
+import calendar
+import collections
+import json
+import os
+import re
+import signal
+import sys
+import time
+
+KEEP_DAYS = int(os.environ.get("MGO1_LOG_KEEP_DAYS", "31"))
+CAP = int(float(os.environ.get("MGO1_LOG_CAP_MB", "64")) * 1024 * 1024)
+
+
+def setting(name, default):
+    """A number of the environment; a value that is no number: the default (the game's lines must go on)."""
+    try:
+        return float(os.environ.get(name, "") or default)
+    except ValueError:
+        return float(default)
+
+
+# (v150-host beta 16) the flood guard: more than BURST lines of one shape in BURST_SECONDS are summarised (0: off)
+BURST = int(setting("MGO1_LOG_BURST", 200))
+BURST_SECONDS = setting("MGO1_LOG_BURST_SECONDS", 10)
+SHAPES = 256                                       # the shapes followed at once (the least recently seen go)
+# (v150-host beta 16) the days' files of a source, and of every source of the server, at most (0: no limit): past it the
+# oldest days go first, never today's. A day is 256 MB at most (4 times the cap), 31 days kept: a bot whose game fails
+# every day could fill 8 GB, each bot and doll its own
+SOURCE_MB = setting("MGO1_LOG_SOURCE_MB", 1024)
+TOTAL_MB = setting("MGO1_LOG_TOTAL_MB", 4096)
+# (v150-host beta 16) the crash reports
+CRASH_LINES = int(setting("MGO1_CRASH_LINES", 4000))           # the game's last lines kept in memory
+CRASH_BYTES = int(setting("MGO1_CRASH_KB", 2048) * 1024)       # a report's size at most
+CRASH_KEEP = int(setting("MGO1_CRASH_KEEP", 40))               # the reports of a folder
+CRASH_HOURLY = int(setting("MGO1_CRASH_HOURLY", 6))            # and written in an hour (0: no limit)
+CRASH_NAME = re.compile(r"^(\d{4})-(\d\d)-(\d\d)_(\d\d)(\d\d)(\d\d)_([a-z0-9]{1,16})(?:_\d)?\.txt$")
+HUNG_FRESH = 120.0                                             # the watchdog's request is taken that long
+# the game's code outside its memory: `ps2: hardware read|write outside the emulated registers at ...` (the same words less
+# "outside ..." are its registers' ordinary lines, a game's start has a hundred of them)
+WILD, WILD_WORDS = "ps2: hardware ", " outside the emulated registers"
+WILD_BEFORE, WILD_AFTER = 200, 100                             # the lines kept before the first one, and from it
+
+# the game's lines that are normal although their words look bad
+BENIGN = re.compile(r"cdbios: search file|vu0: program at .* interpreted|mrdUPnP|ERROR_NONE|\(ignored\)$")
+ERROR = re.compile(r"\bCRASH\b|Unhandled|\bexception\b|\bassert|endless loop|not recompiled nor bridged|through a null pointer"
+                   r"|RESULT .*(fail|error)|\bfatal\b|out of memory|No space left|page fault|segmentation", re.I)
+WARN = re.compile(r"\bstuck\b|given up|gave up|not listed|not found|not readable|refused|timed? ?out|\bfail(ed|s|ure)?\b"
+                  r"|cannot|can't|could not|\berror\b|NOT the maximum|\blost\b|is gone|no game|\bhang|a ray walk with a vector"
+                  r"|missing|\bdropped\b|too many|disconnected|kicked"
+                  # (v150-host beta 16) the game's code outside its memory (MGO1Loader/wildguard.h: `ps2: hardware read outside the
+                  # emulated registers at ...`, `ps2: <n> more accesses outside the memory and the registers in 10 s ...`); a walk
+                  # that never ends says CRASH: (an error, above) and ends the game with 70
+                  r"|outside the emulated registers|outside the memory", re.I)
+START = re.compile(r"^(mgo1host: bot |mgo1doll: doll |mgo1doll-manager: started)")
+# (v150-host beta 16) past the day's cap, the ordinary lines still written: what tells which game, which players and what
+# the dolls did before a failure (10 November 2026: the cap reached at 00:49 UTC by a flood, the whole day's lines of
+# these kinds lost). On the server's own days they are 28 kB an hour for an idle host and 330 kB an hour of play with 3
+# virtual dolls (the net, usbkb, cdbios, keys lines, two thirds of a day's bytes, are not kept): the 192 MB between the cap
+# and 4 times the cap hold 24 days of play; past HARD_CAP the errors and warnings only, as before
+KEPT = re.compile(r"(?:mgo1host|mgo1doll|mgo1doll-manager|mgo1-dollgate|mgo1log): "
+                  r"|(?:ps2|doll)(?: f\d+)?: (?:report: \{|vdoll[ :]|session: |players[ :(]|host watch|host settings|pace: |text: "
+                  r"|unranked: |kick P|command |lobby: |activity: |score: |death: |aim: |VDOLL ADAPT: |clocks: )"
+                  r"|step \d+: ")
+# ((v150-host beta 18) `aim: ` added: a playable doll's direct aim, once a minute and when it falls back to the pad; the
+# joiner's hold (`session: peer ... kept past the game's ...`) and the controls (`vdoll: the bodies play as a player`) were
+# kept already)
+# ((v150-host beta 19) `clocks: ` added: the round's clocks made up on a host short of processor, a line a minute
+# while it works, docs/DEDICATED_HOST.md 23.)
+# ((v150-host beta 19) `VDOLL ADAPT: ` added: a virtual doll's live level judged, written by the game when it moved 0.05 or
+# more (as a playable doll's `DOLL ADAPT:`); `vdoll: level: live ...` and `vdoll: levels now ...` match `vdoll[ :]` already.
+# Past the cap, one `VDOLL ADAPT: vdoll <n>` line a doll a minute at most (THIN): 15 virtual dolls judged every 5 s would
+# otherwise take most of the room between the cap and HARD_CAP; `vdoll: levels now`, at least once a minute, says where
+# every one stands meanwhile. Under the cap every line is written)
+THIN = re.compile(r"^(?:ps2|doll)(?: f\d+)?: VDOLL ADAPT: vdoll (\d+)\b")
+THIN_SECONDS = 60.0
+HARD_CAP = 4 * CAP
+CRASHED = re.compile(r"^(mgo1host|mgo1doll): the game crashed")
+
+
+def level_of(text):
+    if BENIGN.search(text):
+        return "I"
+    if ERROR.search(text):
+        return "E"
+    if WARN.search(text):
+        return "W"
+    return "I"
+
+
+def day_of(t):
+    return time.strftime("%Y-%m-%d", time.gmtime(t))
+
+
+def stamp(t):
+    return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(t)) + ".%03dZ" % int((t % 1) * 1000)
+
+
+def clock(t):
+    return time.strftime("%H:%M:%S", time.gmtime(t)) + ".%03d" % int((t % 1) * 1000)
+
+
+# ---- (v150-host beta 16) the flood guard ---------------------------------------------------------------
+# a number as the game writes one: decimal, hexadecimal (with a digit in it, or 8 letters and more), 0x before it or not;
+# a frame's f2573208 is one too, a word with other letters (ps2, n002a, P1) is not
+NUMBER = re.compile(r"\b(?:0x)?[0-9a-fA-F]*[0-9][0-9a-fA-F]*\b|\b[a-fA-F]{8,}\b")
+# what a number is made of: a line less these bytes is the same for every line of a shape, at a tenth of the
+# cost of the shape itself (measured: 0.2 against 2.7 microseconds a line). The lines are counted by it first
+NUMBER_BYTES = b"0123456789abcdefABCDEFxX"
+
+
+def shape_of(text):
+    """A line's shape: its text with every number replaced."""
+    return NUMBER.sub("<n>", text)
+
+
+def numbers_of(text):
+    """A line's own numbers, for a summary (a memory walk's first and last addresses)."""
+    v = " ".join(NUMBER.findall(text)[:8])
+    return " (%s)" % v[:120] if v else ""
+
+
+class Shape:
+    """A shape's count in the window, and its flood while it lasts."""
+    __slots__ = ("text", "key", "window", "seen", "level", "on", "since", "start", "count", "total", "first", "first_at",
+                 "last", "last_at", "last_m")
+
+    def __init__(self, text, key):
+        self.text, self.key = text, key
+        self.window, self.seen, self.level, self.on = -1, 0, None, False
+        self.since = self.start = self.first_at = self.last_at = self.last_m = 0.0
+        self.count = self.total = 0
+        self.first = self.last = ""
+
+
+class Guard:
+    """The flood guard. take() says whether a line is one of a flood (counted, not written); tick() and end() give
+    the summaries through `say(text, w, lines, level)`: the summary's text, its time, the lines it stands for and
+    their level. Two clocks: m, the guard's own, which only goes forward (the windows, the 10 s: the server's clock set
+    back an hour would hold a flood's summaries that long), and w, the server's, for the times a summary names."""
+
+    def __init__(self, burst, seconds, say=None, table=SHAPES):
+        self.burst, self.seconds, self.say, self.table = burst, seconds, say, table
+        self.until = 0.0                           # the end of the window being counted
+        self.window = 0
+        self.seen = {}                             # a line less its numbers -> its lines of this window; True past the burst
+        self.hot = {}                              # those of the floods (kept from a window to the next): how many floods
+        self.shapes = collections.OrderedDict()    # shape -> Shape, the least recently seen first
+        self.floods = {}                           # the shapes being summarised
+        self.due = float("inf")                    # when the next summary is due
+
+    def take(self, raw, text, m, w):
+        """True: the line belongs to a flood, it is counted for the next summary. False: written as it is."""
+        if m >= self.until:                        # a new window: the counts start again, the floods go on
+            self.until = m + self.seconds
+            self.window += 1
+            self.seen = dict.fromkeys(self.hot, True)
+        key = raw.translate(None, NUMBER_BYTES)
+        c = self.seen.get(key)
+        if c is None:
+            if len(self.seen) >= 4 * self.table:   # (bounded: the counts start again)
+                self.seen = dict.fromkeys(self.hot, True)
+            self.seen[key] = [text]
+            return False
+        if c is not True:
+            c.append(text)
+            if len(c) <= self.burst:
+                return False
+            # more than a burst of lines alike less their numbers: from now on their shapes are counted, those
+            # written so far first
+            self.seen[key] = True
+            for x in c[:-1]:
+                self.shape(x, key, m, w).seen += 1
+        r = self.shape(text, key, m, w)
+        if not r.on:
+            r.seen += 1
+            if r.seen <= self.burst or r.level == "E":
+                return False
+            if r.level is None:
+                r.level = level_of(text)           # (a shape's level: the numbers are no part of the levels' words)
+                if r.level == "E":
+                    return False                   # an error is always written
+            r.on = True
+            r.since = r.start = m
+            r.count = r.total = 0
+            self.floods[r.text] = r
+            self.hot[key] = self.hot.get(key, 0) + 1
+            r.key = key
+            if m + self.seconds < self.due:
+                self.due = m + self.seconds
+        if not r.count:
+            r.first, r.first_at = text, w
+        r.count += 1
+        r.last, r.last_at, r.last_m = text, w, m
+        return True
+
+    def shape(self, text, key, m, w):
+        s = NUMBER.sub("<n>", text)
+        r = self.shapes.get(s)
+        if r is None:
+            if len(self.shapes) >= self.table:
+                self.drop(m, w)
+            r = self.shapes[s] = Shape(s, key)
+        else:
+            self.shapes.move_to_end(s)
+        if r.window != self.window:
+            r.window, r.seen = self.window, 0
+        return r
+
+    def drop(self, m, w):
+        """Room in the table: the least recently seen shape that is no flood goes; all floods: the oldest one's ends."""
+        for s, r in self.shapes.items():
+            if not r.on:
+                del self.shapes[s]
+                return
+        s, r = next(iter(self.shapes.items()))
+        self.close(r, m, w, False)
+        del self.shapes[s]
+
+    def summary(self, r, m):
+        text = r.text if len(r.text) <= 200 else r.text[:197] + "..."
+        return 'mgo1log: %d more lines like "%s" in %d s, the first at %s%s, the last at %s%s (not written one by one)' % (
+            r.count, text, max(1, int(m - r.start + 0.5)), clock(r.first_at), numbers_of(r.first), clock(r.last_at), numbers_of(r.last))
+
+    def close(self, r, m, w, quiet):
+        """A flood's end: its last lines' summary; quiet: the shape came no more than a burst in its last seconds."""
+        if r.count and self.say:
+            self.say(self.summary(r, m), w, r.count, r.level)
+        r.total += r.count
+        if quiet and self.say:
+            text = r.text if len(r.text) <= 200 else r.text[:197] + "..."
+            self.say('mgo1log: no more lines like "%s" for %d s (%d not written one by one in %d s): written one by one again' % (
+                text, max(1, int(m - r.last_m + 0.5)), r.total, max(1, int(r.last_m - r.since + 0.5))), w, 0, r.level)
+        r.on, r.count, r.seen, r.window = False, 0, 0, self.window
+        self.floods.pop(r.text, None)
+        n = self.hot.get(r.key, 0) - 1
+        if n > 0:
+            self.hot[r.key] = n
+        else:
+            self.hot.pop(r.key, None)
+
+    def tick(self, m, w):
+        """The summaries due at m: one a flood every `seconds`; its end once those seconds brought a burst at most, or
+        none of its lines came for that long."""
+        due = float("inf")
+        for r in list(self.floods.values()):
+            if m - r.start >= self.seconds:
+                if r.count <= self.burst or m - r.last_m >= self.seconds:     # quiet again
+                    self.close(r, m, w, True)
+                    continue
+                if self.say:
+                    self.say(self.summary(r, m), w, r.count, r.level)
+                r.total += r.count
+                r.count, r.start = 0, m
+            if r.start + self.seconds < due:
+                due = r.start + self.seconds
+        self.due = due
+
+    def end(self, m, w):
+        """The stream's end: what the floods still count is said."""
+        for r in list(self.floods.values()):
+            self.close(r, m, w, False)
+        self.due = float("inf")
+
+
+def prune(folder):
+    limit = day_of(time.time() - KEEP_DAYS * 86400)
+    try:
+        names = os.listdir(folder)
+    except OSError:
+        return
+    today = day_of(time.time())
+    for n in names:
+        # (and a summary's temporary file a process left behind, once its day is over)
+        if (re.match(r"^\d{4}-\d\d-\d\d\.(log|sum)$", n) and n[:10] < limit) or \
+                (re.match(r"^\d{4}-\d\d-\d\d\.sum(\.\d+)?\.tmp$", n) and n[:10] < today):
+            try:
+                os.remove(os.path.join(folder, n))
+            except OSError:
+                pass
+    if "crash" in names:
+        crash_prune(os.path.join(folder, "crash"))
+
+
+def prune_size(folder):
+    """(v150-host beta 16) The sizes' limits: this source's days past SOURCE_MB, then every source's (the folders beside
+    this one) past TOTAL_MB, lose their oldest days (the largest of a day first), never today's file nor a crash report.
+    Returns (days removed, their bytes)."""
+    today, root = day_of(time.time()), os.path.dirname(os.path.normpath(folder))
+    mine = os.path.basename(os.path.normpath(folder))
+
+    def days(src):
+        out = []
+        try:
+            for n in os.listdir(os.path.join(root, src)):
+                if re.match(r"^\d{4}-\d\d-\d\d\.log$", n):
+                    p = os.path.join(root, src, n)
+                    try:
+                        out.append([n[:10], os.path.getsize(p), p])
+                    except OSError:
+                        pass
+        except OSError:
+            pass
+        return out
+
+    def trim(files, limit):
+        """The oldest days of `files` removed until they fit `limit` bytes."""
+        total, n, size = sum(f[1] for f in files), 0, 0
+        for f in sorted(files, key=lambda f: (f[0], -f[1])):
+            if total <= limit:
+                break
+            if f[0] >= today or not f[1]:
+                continue
+            try:
+                os.remove(f[2])
+            except OSError:
+                continue                           # (another user's: left)
+            try:
+                os.remove(f[2][:-4] + ".sum")
+            except OSError:
+                pass
+            total, n, size, f[1] = total - f[1], n + 1, size + f[1], 0
+        return n, size
+    n = size = 0
+    if SOURCE_MB > 0:
+        n, size = trim(days(mine), SOURCE_MB * 1048576)
+    if TOTAL_MB > 0:
+        try:
+            sources = [x for x in os.listdir(root) if os.path.isdir(os.path.join(root, x))]
+        except OSError:
+            sources = []
+        a, b = trim([f for src in sources for f in days(src)], TOTAL_MB * 1048576)
+        n, size = n + a, size + b
+    return n, size
+
+
+# ---- (v150-host beta 16) the crash reports -------------------------------------------------------------
+def crash_names(folder):
+    """The reports of a crash folder, the oldest first (their names begin with their UTC time)."""
+    try:
+        return sorted(n for n in os.listdir(folder) if CRASH_NAME.match(n))
+    except OSError:
+        return []
+
+
+def crash_time(name):
+    m = CRASH_NAME.match(name)
+    try:
+        return calendar.timegm(tuple(int(x) for x in m.groups()[:6]) + (0, 0, 0))
+    except (AttributeError, ValueError, OverflowError):
+        return 0
+
+
+def crash_prune(folder):
+    """31 days and CRASH_KEEP reports at most: the oldest go (another file there is left alone)."""
+    names = crash_names(folder)
+    limit = day_of(time.time() - KEEP_DAYS * 86400)
+    gone = [n for n in names if n[:10] < limit]
+    left = [n for n in names if n[:10] >= limit]
+    gone += left[:max(0, len(left) - CRASH_KEEP)]
+    for n in gone:
+        try:
+            os.remove(os.path.join(folder, n))
+        except OSError:
+            pass
+
+
+def plain(v, most=200):
+    """A value of the status file as one line of text."""
+    return "".join(ch if " " <= ch <= "~" else "?" for ch in str(v))[:most]
+
+
+def number(v, default=0):
+    return v if isinstance(v, (int, float)) and not isinstance(v, bool) else default
+
+
+def status_lines(path, t):
+    """The game's last status file as the report's header lines: its state, game, round, players with their kinds (a
+    doll by its number, never by a name; a real player by the name the Game Report's lines give him), its pace."""
+    if not path:
+        return []
+    try:
+        age = t - os.path.getmtime(path)
+        with open(path, encoding="utf-8", errors="replace") as f:
+            st = json.load(f)
+        if not isinstance(st, dict):
+            raise ValueError(path)
+    except (OSError, ValueError):
+        return ["status: not readable (%s)" % os.path.basename(path)]
+    out = ["status: written %d s before the end" % max(0, age)]
+    for k in ("state", "frame", "error"):
+        if k in st:
+            out.append("%s: %s" % (k, plain(st[k])))
+    game = st.get("game")
+    if isinstance(game, dict):                         # a bot's
+        out.append("game: %s" % plain(game.get("name", "")))
+        rules, rnd = game.get("rules"), game.get("round")
+        if isinstance(rules, list) and isinstance(rnd, int) and 0 <= rnd < len(rules) and isinstance(rules[rnd], list) and len(rules[rnd]) == 2:
+            out.append("round: %d of %d (rule %s, map %s)" % (rnd + 1, len(rules), plain(rules[rnd][0]), plain(rules[rnd][1])))
+    elif game is not None:                             # a doll's: the game it plays in, what it does there
+        out.append("game: %s" % plain(game))
+        out.append("doll: " + ", ".join("%s %s" % (k, plain(st[k], 40)) for k in ("rule", "map", "phase", "team", "alive", "life", "k", "d", "real_players", "identity",
+                                                                                    "level", "act", "arg") if k in st))
+    players = st.get("players")
+    if isinstance(players, list):
+        out.append("players: %d (%d real, %d dolls, %d host)" % (len(players), number(st.get("players_real")), number(st.get("players_dolls")),
+                                                                  number(st.get("players_host"))))
+        for p in players[:20]:
+            if not isinstance(p, dict):
+                continue
+            kind = p.get("kind", "")
+            who = "host" if kind == "host" or p.get("host") else "virtual doll %d" % p["vdoll"] if number(p.get("vdoll")) > 0 else \
+                "doll %d" % p["doll"] if number(p.get("doll")) > 0 else "doll (an account)" if kind == "doll" else \
+                '%s "%s"' % (plain(kind, 12) or "player", plain(p.get("name", ""), 20))
+            more = ""
+            if who != "host":
+                more = "%s, %d kills, %d deaths" % ({0: ", team red", 1: ", team blue"}.get(p.get("team"), ""), number(p.get("k")), number(p.get("d")))
+                if number(p.get("ping"), -1) > 0:
+                    more += ", ping %d ms" % p["ping"]
+            out.append("player: P%s %s%s" % (plain(p.get("p", "?"), 3), who, more))
+    vdolls = st.get("vdolls")
+    if isinstance(vdolls, list):                       # a bot's virtual dolls (docs/VIRTUAL_DOLL.md): each one's state
+        for v in vdolls[:16]:
+            if isinstance(v, dict):
+                out.append("vdoll: %s %s, player %s%s, %s, %s deaths" % (plain(v.get("n", "?"), 3), plain(v.get("state", "?"), 20), plain(v.get("player", "?"), 3),
+                                                                      {0: ", team red", 1: ", team blue"}.get(v.get("team"), ""), plain(v.get("life", "?"), 20),
+                                                                      plain(v.get("deaths", "?"), 6)))
+    pace = st.get("pace")
+    if isinstance(pace, dict):
+        out.append("pace: %s VBlanks a second (%s due), %s %% of a core" % tuple(plain(pace.get(k, "?"), 10) for k in ("rate", "due", "cpu")))
+    return out
+
+
+def crash_report(folder, why, what, t, ring, name=None, wild=None, handled=0):
+    """Writes <folder>/crash/<UTC time>_<why>.txt: the header, then the lines of `ring` ((time, level, text), the oldest
+    first; the newest are kept when they do not all fit in CRASH_BYTES). wild: the lines kept around the game's first
+    access outside its memory (WILD_BEFORE before it, it, the next ones) and how many lines had been handled when it came;
+    handled: the lines handled in all. Those lines stand first when `ring` holds them no more. Returns (its name, the
+    lines written); (None, why not) when CRASH_HOURLY reports of the last hour are there already or the file cannot be
+    written."""
+    crash = os.path.join(folder, "crash")
+    try:
+        os.makedirs(crash, exist_ok=True)
+    except OSError as e:
+        return None, str(e)
+    names = crash_names(crash)
+    if CRASH_HOURLY > 0 and len([n for n in names if 0 <= t - crash_time(n) < 3600]) >= CRASH_HOURLY:
+        return None, "%d written in the last hour (the first ones of a loop are kept)" % CRASH_HOURLY
+    if not (name and CRASH_NAME.match(name) and name not in names):
+        base = time.strftime("%Y-%m-%d_%H%M%S", time.gmtime(t)) + "_" + why
+        name = base + ".txt"
+        for i in range(2, 10):
+            if name not in names:
+                break
+            name = "%s_%d.txt" % (base, i)
+    version = ""
+    try:
+        with open(os.environ.get("MGO1_CRASH_VERSION", ""), encoding="utf-8", errors="replace") as f:
+            version = plain(f.read().strip())
+    except OSError:
+        pass
+    head = ["MGO1 crash report (host/mgo1log, docs/CRASH_REPORTS.md)", "source: %s" % os.path.basename(os.path.normpath(folder)),
+            "reason: %s" % why, "what: %s" % plain(what, 300), "when: %s" % stamp(t), "version: %s" % (version or "not known")]
+    head += status_lines(os.environ.get("MGO1_CRASH_STATUS", ""), t)
+    first = []                                         # the lines around the first access outside the memory
+    if wild:
+        lines_, at_line, seen_before = wild
+        w = lines_[at_line]
+        head.append("wild: %s %s" % (stamp(w[0]), w[2] if len(w[2]) <= 400 else w[2][:400] + " ..."))
+        gone = handled - len(ring)                     # the lines handled that `ring` holds no more
+        if gone > seen_before - at_line:               # (its oldest line is younger than the first of those kept apart)
+            kept = [x for i, x in enumerate(lines_) if seen_before - at_line + i < gone]
+            first = [("%s %s %s\n" % (stamp(a), lv, x)).encode("utf-8", "replace") for a, lv, x in kept]
+            between = gone - (seen_before - at_line) - len(kept)
+            if between > 0 and ring:
+                first.append(("%s W mgo1log: %d lines the game wrote here are not in this report (it keeps the %d lines before the first access outside "
+                              "the memory, the %d from it and the last %d; the daily log has those its cap let through)\n" % (
+                                  stamp(ring[0][0]), between, WILD_BEFORE, WILD_AFTER, CRASH_LINES)).encode("utf-8", "replace"))
+    room = CRASH_BYTES - sum(len(x) + 1 for x in head) - sum(len(x) for x in first) - 200
+    body = []
+    for at, lv, text in reversed(ring):                # the newest first: the last lines before the end are the ones kept
+        line = ("%s %s %s\n" % (stamp(at), lv, text)).encode("utf-8", "replace")
+        if len(line) > room:
+            break
+        room -= len(line)
+        body.append(line)
+    body.reverse()
+    body = first + body
+    head.append("lines: %d, %s%s" % (len(body), "the last ones before the end" if not first else "those around the first access outside the memory, then the last "
+                                     "ones before the end", ", from %s" % body[0][:24].decode() if body else ""))
+    try:
+        tmp = os.path.join(crash, ".new")
+        with open(tmp, "wb") as f:
+            f.write(("\n".join(head) + "\n----\n").encode("utf-8", "replace"))
+            f.writelines(body)
+        os.replace(tmp, os.path.join(crash, name))
+    except OSError as e:
+        return None, str(e)
+    crash_prune(crash)
+    return name, len(body)
+
+
+def ended(folder, t):
+    """How the game ended, for its crash report: (reason, words, the report's name or None); (None, ...) for an end
+    that is no failure. The doll manager's request first (a hung game it restarts: <folder>/crash/.hung, fresh), then the
+    exit code the launcher wrote (MGO1_CRASH_EXIT, in its run folder, new at each start); neither: the service was stopped."""
+    mark = os.path.join(folder, "crash", ".hung")
+    try:
+        fresh = t - os.path.getmtime(mark) <= HUNG_FRESH
+        with open(mark, encoding="utf-8", errors="replace") as f:
+            req = json.load(f)
+        os.remove(mark)
+        if fresh and isinstance(req, dict):
+            m = CRASH_NAME.match(req["name"]) if isinstance(req.get("name"), str) else None
+            return "hung", plain(req.get("what") or "its game was hung: restarted by the doll manager", 300), req["name"] if m and m.group(7) == "hung" else None
+    except (OSError, ValueError):
+        pass
+    try:
+        with open(os.environ.get("MGO1_CRASH_EXIT", "")) as f:
+            code = int(f.read().strip())
+    except (OSError, ValueError):
+        return None, "", None
+    quiet = "ended with no failure said (exit code %d)" % code
+    for pair in os.environ.get("MGO1_CRASH_ENDS", "").split():          # the launcher's own codes
+        k, _, v = pair.partition("=")
+        if k == str(code):
+            if not re.match(r"^[a-z0-9]{1,16}$", v):
+                return None, quiet, None
+            return v, "the game ended by itself: its game or its link was lost (exit code %d)" % code if v == "lost" else \
+                "the game ended with code %d (%s)" % (code, v), None
+    if code == 0:
+        return None, quiet, None
+    if code == 70:
+        return "crash70", "the game crashed (exit code 70): its CRASH line below tells where", None
+    if 128 < code < 256:
+        return "signal%d" % (code - 128), "the game was ended by signal %d%s" % (code - 128, " (killed: out of memory, or forced)" if code == 137 else ""), None
+    return "exit%d" % code if 0 < code < 100000 else "exit", "the game ended with code %d" % code, None
+
+
+class DayLog:
+    """The day's file of one folder, kept open; the next day's opened at midnight UTC."""
+
+    def __init__(self, folder):
+        self.folder = folder
+        self.day = None
+        self.f = None
+        self.sum = {}
+        self.base = {}
+        self.removed = (0, 0)
+        self.sum_at = 0.0
+        self.capped = 0                                # 1 past the cap (E, W and the KEPT lines), 2 past 4 times the cap (E, W)
+        self.thinned = {}                              # (beta 19) past the cap: a virtual doll's last VDOLL ADAPT line written
+        try:
+            os.makedirs(folder, exist_ok=True)
+        except OSError:
+            pass
+        prune(folder)
+
+    def _open(self, day):
+        self.close()
+        self.day = day
+        path = os.path.join(self.folder, day + ".log")
+        try:
+            self.f = open(path, "a", encoding="utf-8", errors="replace")
+        except OSError:
+            self.f = None
+        self.sum = self.read_sum(day)
+        self.base = dict(self.sum)                     # the file's counts as this process last read or wrote them
+        try:
+            size = os.path.getsize(path)
+            self.capped = 2 if size >= HARD_CAP else 1 if size >= CAP else 0
+        except OSError:
+            self.capped = 0
+        prune(self.folder)
+        self.removed = prune_size(self.folder) if day == day_of(time.time()) else (0, 0)
+
+    def write(self, text, level=None, t=None):
+        t = time.time() if t is None else t
+        day = day_of(t)
+        if day != self.day:
+            self._open(day)
+            if self.removed[0]:                        # (said in the day's log, once)
+                n, size = self.removed
+                self.removed = (0, 0)
+                self.write("mgo1log: the logs took more than %g MB a source or %g MB in all: %d of the oldest days removed (%d MB)" % (
+                    SOURCE_MB, TOTAL_MB, n, size // 1048576), "W", t)
+        lv = level or level_of(text)
+        s = self.sum
+        s["lines"] += 1
+        if lv in ("E", "W"):
+            s[lv] += 1
+        if START.search(text):
+            s["starts"] += 1
+        if CRASHED.search(text):
+            s["crashes"] += 1
+        at = stamp(t)                                  # (v150-host beta 16: made once a line, it was made three times)
+        s["first"] = s["first"] or at
+        s["last"] = at
+        if self.f:
+            try:
+                if not self.capped or lv != "I" or (self.capped == 1 and KEPT.match(text) and self.thin(text, t)):
+                    self.f.write("%s %s %s\n" % (at, lv, text))
+                    self.f.flush()
+                    if self.capped < 2 and self.f.tell() >= (CAP, HARD_CAP)[self.capped]:
+                        self.capped += 1
+                        self.f.write("%s W mgo1log: this day's file reached %g MB: %s from now on\n" % (
+                            at, (CAP, HARD_CAP)[self.capped - 1] / 1048576.0, "only the errors and warnings" if self.capped == 2 else
+                            "only the errors, the warnings and the lines a post-mortem needs (the launchers', the Game Report's, "
+                            "the players', the virtual dolls', the sessions', the screens, the pace; docs/LOGS.md)"))
+                        self.f.flush()
+            except OSError:
+                pass
+        if lv == "E" or t - self.sum_at > 10:          # (a warning's count too within 10 s: no file written a line)
+            self.save_sum(t)
+
+    def thin(self, text, t):
+        """(v150-host beta 19) Past the cap: a `VDOLL ADAPT: vdoll <n>` line written when that doll's last one written is a
+        minute old (any other kept line: written)."""
+        m = THIN.match(text)
+        if not m:
+            return True
+        last = self.thinned.get(m.group(1))
+        if last is not None and 0 <= t - last < THIN_SECONDS:
+            return False
+        self.thinned[m.group(1)] = t
+        return True
+
+    def flood(self, lines, level, t):
+        """(v150-host beta 16) Lines a summary of the flood guard stands for: counted in the day's summary."""
+        day = day_of(t)
+        if day != self.day:
+            self._open(day)
+        self.sum["lines"] += lines
+        self.sum["flood"] += lines
+        if level == "W":
+            self.sum["W"] += lines
+
+    def read_sum(self, day):
+        """The day's summary as its file has it (zeros without one)."""
+        out = {"lines": 0, "E": 0, "W": 0, "starts": 0, "crashes": 0, "first": "", "last": "", "flood": 0}
+        try:
+            with open(os.path.join(self.folder, day + ".sum"), encoding="utf-8") as s:
+                old = json.load(s)
+            if isinstance(old, dict):
+                out.update({k: old[k] for k in out if k in old and isinstance(old[k], type(out[k])) and not isinstance(old[k], bool)})
+        except (OSError, ValueError):
+            pass
+        return out
+
+    def save_sum(self, t=None):
+        """The day's summary written. Several processes write it (a game's stream, the notes of its launcher and of the
+        doll manager): the file is read again and only what this process counted since its last read or write is added
+        (it wrote its own totals: a note's count written meanwhile was lost at the stream's next save)."""
+        self.sum_at = time.time() if t is None else t
+        if not self.day:
+            return
+        path = os.path.join(self.folder, self.day + ".sum")
+        now = self.read_sum(self.day)
+        for k, v in self.sum.items():
+            if isinstance(v, int):
+                now[k] += v - self.base.get(k, 0)
+        mine, theirs = self.sum["first"], now["first"]
+        now["first"] = min(mine, theirs) if mine and theirs else mine or theirs
+        now["last"] = max(self.sum["last"], now["last"])
+        self.sum, self.base = now, dict(now)
+        tmp = "%s.%d.tmp" % (path, os.getpid())        # (a name of its own: two processes at once)
+        try:
+            with open(tmp, "w", encoding="utf-8") as s:
+                json.dump(self.sum, s, separators=(",", ":"))
+            os.replace(tmp, path)
+        except OSError:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+
+    def close(self):
+        if self.f:
+            self.save_sum()
+            try:
+                self.f.close()
+            except OSError:
+                pass
+            self.f = None
+
+
+class Stop(Exception):
+    """The service's stop."""
+
+
+class Stream:
+    """(v150-host beta 16) A game's lines one by one: the flood guard, then the journal (out), the day's file and the
+    last lines kept in memory for a crash report (keep of them, CRASH_BYTES at most)."""
+
+    def __init__(self, log, out, guard, keep=0):
+        self.log, self.out, self.guard, self.keep = log, out, guard, keep
+        self.ring = collections.deque()               # (time, level, text): what was handled, written to the day's file or not
+        self.held = 0
+        self.handled = 0                              # the lines handled in all
+        self.wild = None                              # the game's first access outside its memory: (lines, its place there, lines before)
+        self.wild_more = 0                            # the lines still to keep after it
+        if guard is not None:
+            guard.say = self.summary
+
+    def line(self, raw, t, m=None):
+        """A line at the server's time t; m: the guard's clock (time.monotonic(); the tests give their own, or t alone)."""
+        text = raw.decode("utf-8", "replace").rstrip("\r\n")
+        g = self.guard
+        if g is not None:
+            if m is None:
+                m = t
+            if m >= g.due:
+                g.tick(m, t)
+            if g.take(raw, text, m, t):
+                return
+        self.put(text, None, t)
+
+    def summary(self, text, t, lines, level):
+        if lines:
+            self.log.flood(lines, level, t)
+        self.put(text, "W", t)
+
+    def put(self, text, level, t):
+        if self.out is not None:
+            try:
+                self.out.write(text + "\n")
+                self.out.flush()
+            except (OSError, ValueError):
+                self.out = None                   # the journal gone: the file goes on
+        if level is None:
+            level = level_of(text)
+        if self.keep:
+            ring = self.ring
+            kept = text if len(text) <= 4000 else text[:4000] + " ... (%d characters)" % len(text)
+            if self.wild_more:                        # the lines from the first access outside the memory, kept apart
+                self.wild[0].append((t, level, kept))
+                self.wild_more -= 1
+            elif self.wild is None and text.startswith(WILD) and WILD_WORDS in text:
+                last = list(ring)[-WILD_BEFORE:] if len(ring) > WILD_BEFORE else list(ring)
+                self.wild = (last + [(t, level, kept)], len(last), self.handled)
+                self.wild_more = WILD_AFTER - 1
+            ring.append((t, level, kept))
+            self.handled += 1
+            self.held += len(kept) + 28
+            while len(ring) > self.keep or self.held > CRASH_BYTES:
+                self.held -= len(ring.popleft()[2]) + 28
+        self.log.write(text, level, t)
+
+    def end(self, t, m=None):
+        """The stream's end (the game ended, or its service stops it): the floods' last counts, then the crash report
+        when the game ended badly."""
+        if self.guard is not None:
+            self.guard.end(t if m is None else m, t)
+        if self.keep:
+            why, what, name = ended(self.log.folder, t)
+            if not why and self.wild:                  # no failure said, but its code went outside its memory: its lines kept
+                why = "wild"
+                what = "the game %s after its code went outside its memory (the `wild:` line below): the lines before that kept" % (
+                    what or "was stopped by its service")
+            if why:
+                name, n = crash_report(self.log.folder, why, what, t, self.ring, name, self.wild, self.handled)
+                if name:
+                    self.put("mgo1log: crash report crash/%s (%s: the game's last %d lines before its end; docs/CRASH_REPORTS.md)" % (name, why, n), "W", t)
+                else:
+                    self.put("mgo1log: no crash report for this end (%s): %s" % (why, n), "W", t)
+        self.log.close()
+
+
+def main(argv):
+    folder, note, level, quiet = None, None, None, False
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--dir" and i + 1 < len(argv):
+            folder = argv[i + 1]; i += 2
+        elif a == "--note" and i + 1 < len(argv):
+            note = argv[i + 1]; i += 2
+        elif a == "--level" and i + 1 < len(argv) and argv[i + 1] in ("E", "W", "I"):
+            level = argv[i + 1]; i += 2
+        elif a == "--quiet":
+            quiet = True; i += 1
+        else:
+            sys.stderr.write("usage: mgo1log --dir <folder> [--note <text> [--level E|W|I]] [--quiet]\n")
+            return 2
+    if not folder:
+        sys.stderr.write("mgo1log: --dir is missing\n")
+        return 2
+    log = DayLog(folder)
+    if note is not None:
+        log.write(note.replace("\n", " "), level)
+        log.close()
+        if not quiet:
+            print(note, flush=True)
+        return 0
+
+    # (v150-host beta 16) a stop (its service's SIGTERM) ends the reading wherever it is; the end is then written
+    # without a second one cutting it
+    state = {"stop": False}
+
+    def stop(*_):
+        if not state["stop"]:
+            state["stop"] = True
+            raise Stop()
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGHUP, stop)
+    stream = Stream(log, None if quiet else sys.stdout, Guard(BURST, BURST_SECONDS) if BURST > 0 and BURST_SECONDS > 0 else None,
+                    max(0, CRASH_LINES))
+    line, now, mono = stream.line, time.time, time.monotonic
+    stopped = False
+    try:
+        for raw in sys.stdin.buffer:
+            line(raw, now(), mono())
+    except Stop:
+        stopped = True
+    state["stop"] = True
+    if stopped:                                      # what the pipe still holds (the game's last lines), without waiting for more
+        try:
+            os.set_blocking(sys.stdin.fileno(), False)
+            for _ in range(20000):
+                raw = sys.stdin.buffer.readline()
+                if not raw:
+                    break
+                line(raw, now(), mono())
+        except (OSError, ValueError):
+            pass
+    stream.end(now(), mono())
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except KeyboardInterrupt:
+        sys.exit(0)

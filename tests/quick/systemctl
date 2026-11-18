@@ -1,0 +1,77 @@
+#!/usr/bin/env python3
+"""(build 1.00, quickstart) A stand-in systemctl for tests/fake_ssh_host.py's sandbox (<root>/bin/systemctl): units' states in
+<root>/svc; mgo1host@<n> started as tests/quick/fake_game.py <n> in bot n's run folder (the agent finds it there)."""
+import os, signal, subprocess, sys
+
+R = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+SVC = os.path.join(R, "svc")
+
+
+def state(unit):
+    try:
+        return open(os.path.join(SVC, unit + ".state")).read().strip()
+    except OSError:
+        return "inactive"
+
+
+def put(unit, what, value):
+    os.makedirs(SVC, exist_ok=True)
+    with open(os.path.join(SVC, unit + "." + what), "w") as f:
+        f.write(value)
+
+
+def stop(unit):
+    try:
+        pid = int(open(os.path.join(SVC, unit + ".pid")).read())
+        os.kill(pid, signal.SIGTERM)
+    except (OSError, ValueError):
+        pass
+    put(unit, "state", "inactive")
+
+
+def start(unit):
+    if unit.startswith("mgo1host@"):
+        n = unit.split("@", 1)[1].split(".")[0]
+        run = os.path.join(R, "var", "bot" + n, "run")
+        os.makedirs(run, exist_ok=True)
+        log = open(os.path.join(SVC, unit + ".log"), "a")
+        p = subprocess.Popen([sys.executable, os.path.join(R, "bin", "fake_game.py"), n, "mgo1host.exe"], cwd=run, stdout=log, stderr=log,
+                             stdin=subprocess.DEVNULL, start_new_session=True)
+        put(unit, "pid", str(p.pid))
+    put(unit, "state", "active")
+
+
+def main():
+    args = [a for a in sys.argv[1:] if not a.startswith("--") or a == "--now"]
+    if not args:
+        return 0
+    cmd, units = args[0], [a for a in args[1:] if a != "--now"]
+    units = [u[:-8] if u.endswith(".service") else u for u in units]
+    if cmd == "is-active":
+        s = state(units[0]) if units else "inactive"
+        print(s)
+        return 0 if s == "active" else 3
+    if cmd == "is-enabled":
+        try:
+            e = open(os.path.join(SVC, units[0] + ".enabled")).read().strip()
+        except (OSError, IndexError):
+            e = "disabled"
+        print(e)
+        return 0 if e == "enabled" else 1
+    for u in units:
+        if cmd in ("enable", "start") and ("--now" in sys.argv or cmd == "start"):
+            if state(u) != "active":
+                start(u)
+        if cmd in ("disable", "stop") and ("--now" in sys.argv or cmd == "stop"):
+            stop(u)
+        if cmd == "restart":
+            stop(u)
+            start(u)
+        if cmd == "enable":
+            put(u, "enabled", "enabled")
+        if cmd == "disable":
+            put(u, "enabled", "disabled")
+    return 0
+
+
+sys.exit(main())

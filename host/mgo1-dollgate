@@ -1,0 +1,429 @@
+#!/usr/bin/env python3
+"""mgo1-dollgate: the lobby of one bot's accountless PLAYABLE DOLLs (docs/PLAYABLE_DOLL.md 1), on 127.0.0.1
+only. host/mgo1host.sh starts one with its bot; the dolls of that bot (host/mgo1doll.sh with no account)
+log in here as DOLL_<n> (no password checked), see the bot's game alone in the Join Game list and get its
+address, then play in it as players do; (v141 beta 5) the name the game shows is the doll's DOLL_NAME (its launcher
+writes it into its folder, <state root>/doll<n>/display_name), else DOLL_<n>. Doll n's user id is 0x7F000000 + n (n = 1 to 64): SaveMGO's
+TX-55 numbers its accounts from 1 up (database ids), far below; the bot's game keeps the frames naming
+these ids off SaveMGO's lobby (MGO1_DOLL_IDS, MGO1Loader/lobby_filter.h).
+
+The frames are TX-55's (pkg/konamiserver: {u16 command, u16 length, u32 sequence} big-endian, MD5,
+body, XOR 5A 70 85 AF), the answers those MGO1 reads (tests/fake_gate.py, docs/NTMENU2_FLOW.md 7):
+  gate:  2005 lobby list, 2008 news, 2006 time, 0005, 3001 nonce, 3003 log-in, 3040 session, 3042 notices,
+         3046; 0003 ends
+  lobby: 3003 log-in, 0005, 4100 profile, 4102 stats, 4110, 4112, 4700, 4300 the game list (the bot's
+         game, while it hosts: Host Only, its maximum and the options a host tells SaveMGO's list, from the
+         running game's status and settings; tests/test_dollgate.py), 4312 its details, 4320 its address (the
+         bot's own: the address of the server's default route, as the game binds its UDP port there, and the
+         bot's UDP port), 4322, 4580 an empty list; anything else cmd + 1 {0}
+A reply's frames go in one write. Nothing secret here: no account, no password is ever read or logged.
+
+  mgo1-dollgate --bot 1 [--gate-port 5760] [--lobby-port 5761] [--host-addr A] [--host-port 5730]
+                [--game-file /etc/mgo1host/bot1.game] [--status /var/lib/mgo1host/bot1/run/status.json]
+                [--log-dir /var/log/mgo1host/bot1] [--state-root /var/lib/mgo1host]
+Standard library only.
+"""
+import argparse
+import hashlib
+import json
+import os
+import re
+import socket
+import struct
+import subprocess
+import sys
+import threading
+import time
+
+KEY = bytes.fromhex("5a7085af")
+NONCE = bytes.fromhex("84bdb8cfad46dd6e424ae4d8d26a12f3")     # TX-55's (types.NONCE): any 16 bytes do
+ID_BASE = 0x7F000000                                          # doll n: ID_BASE + n
+MAX_DOLLS = 64
+NAME_RE = re.compile(r"^DOLL_([1-9]|[1-5][0-9]|6[0-4])$")
+DISPLAY_RE = re.compile(r"^[A-Za-z0-9._!?+*-][A-Za-z0-9._!?+* -]{1,13}[A-Za-z0-9._!?+*-]$")   # (mgo1host-agent's DOLL_NAME_RE)
+LOCK = threading.Lock()
+ARGS = None
+
+
+def say(text, level="I"):
+    """A line of the gate's: the journal (the bot's service), and its daily log for the ones that matter."""
+    print("mgo1-dollgate: " + text, flush=True)
+    log = os.environ.get("MGO1LOG", "/usr/local/bin/mgo1log")
+    if ARGS and ARGS.log_dir and level != "-" and os.access(log, os.X_OK):
+        try:
+            subprocess.run([log, "--dir", ARGS.log_dir, "--note", "mgo1-dollgate: " + text, "--level", level, "--quiet"],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
+        except (OSError, subprocess.SubprocessError):
+            pass
+
+
+def xor(b):
+    return bytes(c ^ KEY[i & 3] for i, c in enumerate(b))
+
+
+def frame(cmd, seq, body):
+    h = struct.pack(">HHI", cmd, len(body), seq)
+    return xor(h + hashlib.md5(h + body).digest() + body)
+
+
+def read_frame(s):
+    """(command, body), None when the connection ends."""
+    h = b""
+    while len(h) < 24:
+        c = s.recv(24 - len(h))
+        if not c:
+            return None
+        h += c
+    hd = xor(h)
+    cmd, n, _ = struct.unpack(">HHI", hd[:8])
+    raw = b""
+    while len(raw) < n:
+        c = s.recv(n - len(raw))
+        if not c:
+            return None
+        raw += c
+    return cmd, bytes(c ^ KEY[(24 + i) & 3] for i, c in enumerate(raw))
+
+
+class Out:
+    """A connection's answers, numbered from 1; several frames of one reply in one write."""
+
+    def __init__(self, s):
+        self.s, self.seq = s, 0
+
+    def send(self, *frames):
+        data = b""
+        for cmd, body in frames:
+            self.seq += 1
+            data += frame(cmd, self.seq, body)
+        self.s.sendall(data)
+
+
+def u32(v):
+    return struct.pack(">I", v & 0xFFFFFFFF)
+
+
+def text(t, n):
+    return t.encode("ascii", "replace")[:n - 1].ljust(n, b"\0")
+
+
+# ---- what the gate knows of its bot: its game's name, whether it hosts, its players ----
+def game_name():
+    """The running game's name: its settings' (the copy its launcher gave it, run/game.ini; (v150-host beta 22, sync) a save in
+    MGO1 Host without a restart changes the bot's file, not the game that runs), else the bot's file's, else its status's."""
+    name = run_setting("name")
+    if name:
+        return name
+    st = bot_status() or {}
+    return (st.get("game") or {}).get("name") or ""
+
+
+def run_setting(key):
+    """(v150-host beta 16) A key of the running game's settings: the copy mgo1host.sh gave it (game.ini beside its status
+    file), else the bot's settings file (which may have changed since the game's start); "" when it has none."""
+    for path in ([os.path.join(os.path.dirname(ARGS.status), "game.ini")] if ARGS.status else []) + [ARGS.game_file]:
+        try:
+            found = None
+            for line in open(path, encoding="utf-8", errors="replace"):
+                m = re.match(r"\s*%s\s*=\s*(.*?)\s*$" % re.escape(key), line)
+                if m and not line.lstrip().startswith("#"):
+                    found = m.group(1)
+            if found is not None:
+                return found
+        except (OSError, TypeError):
+            pass
+    return ""
+
+
+def game_rotation(st=None):
+    """(v141) The running game's rotation as [(rule, map)]: its status's (the game as the host made it: a map it does not
+    have left out), else its settings' (empty: none there)."""
+    try:
+        rules = ((st or {}).get("game") or {}).get("rules") or []
+        if rules:
+            return [(int(a), int(b)) for a, b in rules]
+        return [(int(a), int(b)) for a, b in re.findall(r"(\d+)\s*:\s*(\d+)", run_setting("rotation"))]
+    except (AttributeError, TypeError, ValueError):
+        return []
+
+
+def game_most(st=None):
+    """(v150-host beta 16) The running game's maximum of players, its host one of them: its status's (the 0x4310's: the
+    Create Game screens keep 9 at most) or its settings' max_players, the larger; 9 with neither (8 players and the host)."""
+    try:
+        told = int(((st or {}).get("game") or {}).get("max") or 0)
+    except (AttributeError, TypeError, ValueError):
+        told = 0
+    v = run_setting("max_players")
+    own = min(16, int(v)) if v.isdigit() else 0
+    return max(told, own) or 9
+
+
+def list_options(most, st=None):
+    """(v141) The host list's second options byte as the host tells it (MGO1Loader/openfix.h, tsne.h, basecap.h): the
+    extra maps 13 to 15 (bits 2 to 4), more than 8 players (bit 5), BASE CAPTURE (bit 6), TEAM SNEAKING (bit 7); the
+    dolls' join tries that dialect first."""
+    rot = game_rotation(st)
+    o = 0
+    for rule, mp in rot:
+        if 13 <= mp <= 15:
+            o |= (0x04, 0x08, 0x10)[mp - 13]
+        if rule == 5:
+            o |= 0x80
+        if rule == 6:
+            o |= 0x40
+    if most > 9:
+        o |= 0x20
+    return o
+
+
+def bot_status():
+    """The bot's status file, when fresh (it is written every second); None without one."""
+    if not ARGS.status:
+        return None
+    try:
+        if time.time() - os.path.getmtime(ARGS.status) > 60:
+            return None
+        with open(ARGS.status, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def hosting():
+    if not ARGS.status:
+        return True
+    st = bot_status()
+    return bool(st) and st.get("state") == "hosting"
+
+
+def display_name(n):
+    """(v141 beta 5) Doll n's name in the game: its DOLL_NAME (host/mgo1doll.sh writes it into the doll's folder at its
+    start), else DOLL_<n>."""
+    try:
+        with open(os.path.join(ARGS.state_root, "doll%d" % n, "display_name"), encoding="ascii", errors="replace") as f:
+            nm = f.readline().strip()
+        if DISPLAY_RE.match(nm) and "  " not in nm:
+            return nm
+    except (OSError, TypeError):
+        pass
+    return "DOLL_%d" % n
+
+
+def default_address():
+    """The address of the server's default route: the game binds its UDP port there (MGO1Loader/ps2world.cpp
+    Host(): the adapter of the route to 8.8.8.8, its first IPv4 address). No packet is sent."""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 53))
+        a = s.getsockname()[0]
+        s.close()
+        return a
+    except OSError:
+        return "127.0.0.1"
+
+
+# ---- the gate (its port): the lobby list, the news, the log-in of DOLL_<n> ----
+SESSIONS = {}                                                 # token -> user id (the lobby's log-in)
+
+
+def gate(s):
+    out = Out(s)
+    me = {}
+
+    def ent(i, t, name, port, a, b):
+        return u32(i) + u32(t) + text(name, 16) + b"127.0.0.1".ljust(15, b"\0") + struct.pack(">HHH", port, a, b)
+    while True:
+        p = read_frame(s)
+        if p is None:
+            return
+        cmd, body = p
+        if cmd == 0x2005:
+            lst = (ent(1, 0, "gate-server", ARGS.gate_port, 1, 1) + ent(2, 1, "account-server", ARGS.gate_port, 0, 2)
+                   + ent(3, 2, "DOLLS", ARGS.lobby_port, 1, 3))
+            out.send((0x2002, u32(0)), (0x2003, lst), (0x2004, u32(0)))
+        elif cmd == 0x2008:
+            item = (u32(0) + b"\x01\x01" + time.strftime("%Y-%m-%d %H:%M:%S").encode()[:19].ljust(19, b"\0")
+                    + text("PLAYABLE DOLLS", 64) + b"The server's own players.\0")
+            out.send((0x2009, u32(0)), (0x200A, item), (0x200B, u32(0)))
+        elif cmd == 0x2006:
+            out.send((0x2007, u32(int(time.time()))))
+        elif cmd == 0x0005:
+            out.send((0x0005, b""))
+        elif cmd == 0x3001:
+            out.send((0x3002, NONCE))
+        elif cmd == 0x3003:
+            user = body[:16].split(b"\0")[0].decode("ascii", "replace").upper()
+            m = NAME_RE.match(user)
+            if not m or len(body) != 32:
+                say("a log-in refused: not a DOLL_<1-64> account", "W")
+                out.send((0x3004, struct.pack(">i", -4)))     # (the game: 816:-4, a wrong account)
+                continue
+            n = int(m.group(1))
+            token = os.urandom(16)
+            me["uid"], me["name"] = ID_BASE + n, display_name(n)
+            with LOCK:                                        # (v141 beta 4) its last log-in's only: kept forever before
+                for old in [t for t, u in SESSIONS.items() if u == ID_BASE + n]:
+                    del SESSIONS[old]
+                SESSIONS[token] = ID_BASE + n
+            out.send((0x3004, u32(0) + token))
+            say("%s logged in (user id %#x)%s" % (user, ID_BASE + n, "" if me["name"] == user else ", named " + me["name"]))
+        elif cmd == 0x3040:
+            uid = me.get("uid", 0)
+            out.send((0x3041, u32(0) + u32(uid) + text(me.get("name", ""), 16)))
+        elif cmd == 0x3042:                                  # no notice (as for a new SaveMGO account)
+            out.send((0x3043, u32(0)), (0x3045, u32(0)))
+        elif cmd == 0x3046:
+            out.send((0x3047, u32(0)))
+        elif cmd == 0x0003:
+            return
+        else:
+            print("mgo1-dollgate: gate %04x (%d bytes): answered %04x {0}" % (cmd, len(body), cmd + 1), flush=True)
+            out.send((cmd + 1, u32(0)))
+
+
+# ---- the lobby (its port): the dolls' lobby, the bot's game alone ----
+GAME_ID = 1000
+
+
+def lobby(s):
+    out = Out(s)
+    me = {"uid": 0, "name": ""}
+    while True:
+        p = read_frame(s)
+        if p is None:
+            return
+        cmd, body = p
+        if cmd == 0x3003:                                    # {u32 user id, token 16}
+            uid = struct.unpack(">I", body[:4])[0] if len(body) >= 4 else 0
+            with LOCK:
+                known = SESSIONS.get(body[4:20]) == uid
+            n = uid - ID_BASE
+            if not known and not 1 <= n <= MAX_DOLLS:
+                out.send((0x3004, struct.pack(">i", -3)))
+                continue
+            me["uid"], me["name"] = uid, display_name(n)
+            out.send((0x3004, u32(0)))
+        elif cmd == 0x0005:
+            out.send((0x0005, b""))
+        elif cmd == 0x4100:
+            # the player's profile as MGO1 reads it (0x193040, 552 bytes: u32 id, name 16, u32, text 16, four
+            # u16, three u32, 320 bytes, text 32, 16 u32, 16 u32, 2 u32, u32), then 0x4104 parts 0 and 1
+            prof = (u32(me["uid"]) + text(me["name"], 16) + u32(0) + bytes(16) + bytes(8) + bytes(12) + bytes(320)
+                    + bytes(32) + bytes(64) + bytes(64) + bytes(8) + u32(0))
+            rec = bytes(4 + 4 + 2 + 2 + 26 * 4)
+            out.send((0x4101, prof), (0x4104, u32(0) + rec * 5), (0x4104, u32(1) + rec * 5))
+        elif cmd == 0x4102:
+            who = struct.unpack(">I", body[:4])[0] if len(body) >= 4 else 0
+            rec = bytes(4 + 4 + 2 + 2 + 26 * 4)
+            out.send((0x4103, u32(0) + u32(who) + text(me["name"] if who in (0, me["uid"]) else "", 16) + u32(0) + bytes(16)
+                      + bytes(8) + bytes(28)),
+                     (0x4105, u32(0) + u32(0) + rec * 5), (0x4105, u32(0) + u32(1) + rec * 5))
+        elif cmd == 0x4300:
+            name = game_name()
+            frames = [(0x4301, u32(0))]
+            if name and hosting():
+                st = bot_status() or {}
+                most = game_most(st)
+                opts = list_options(most, st)
+                # (v141 beta 5) a game of 9 (8 players and the host) told as 9, as the host tells the lobby (a doll takes a
+                # game for a big one from the hint alone); HOST_LIST_9_AS_8=1 (server.env): told as 8, as beta 4
+                if most == 9 and os.environ.get("HOST_LIST_9_AS_8") == "1":
+                    most = 8
+                players = len([q for q in st.get("players", []) if not q.get("host")])
+                # 45 bytes (TX-55's ResponseGameListEntry): id, name 16, password lock (none: the dolls need no
+                # password), host only, rule and map, weapons, most players, switches 2, players, ping, ...
+                # (v150-host beta 16) Host Only 1, as SaveMGO's list tells it (IsHostOnly: a bot's game always is): the
+                # game takes a game of 9 not Host Only for a game of the PCs (MGO1Loader/netfix.h NetBigChosen: its
+                # maximum counts a host who does not play), and beta 15's dolls joined their bot's game of 9 in the PCs'
+                # dialect: no answer from a host of the stock programs' dialect, `( 1059 )`, for ever
+                e = (u32(GAME_ID) + text(name, 16) + bytes([0, 1, 0, 0, 0, max(0, min(255, most))]) + bytes([0, opts])
+                     + bytes([max(0, min(255, players))]) + u32(0) + bytes([0, 0]) + u32(0) + struct.pack(">H", 0) + u32(0))
+                frames.append((0x4302, e))
+            frames.append((0x4303, u32(0)))
+            out.send(*frames)
+        elif cmd == 0x4312:
+            gid = struct.unpack(">I", body[:4])[0] if len(body) >= 4 else 0
+            det = (u32(0) + u32(gid) + text(game_name(), 16) + bytes(128) + bytes(2) + bytes(32) + bytes(5)
+                   + struct.pack(">IIHHIIH", 0, 0, 0, 0, 0, 0, 0) + bytes(1) + bytes(44) + struct.pack(">HI", 0, 0)
+                   + bytes(1) + b"\0\0" + bytes(1) + struct.pack(">HHI", 0, 0, 0))
+            out.send((0x4313, det + u32(1) + text("HOST", 16) + bytes(1) + bytes(20)))
+        elif cmd == 0x4320:                                  # {u32 game id, password 16}: the bot's address
+            a = text(ARGS.host_addr, 16) + struct.pack(">H", ARGS.host_port)
+            out.send((0x4321, u32(0) + a + a))
+            say("%s joins bot %d's game at %s:%d" % (me["name"] or "a doll", ARGS.bot, ARGS.host_addr, ARGS.host_port))
+        elif cmd == 0x4580:                                  # a friend or black list: empty
+            out.send((0x4581, u32(0)), (0x4583, u32(0)))
+        elif cmd == 0x0003:
+            return
+        else:
+            # 4110 player settings, 4112, 4700 its network, 4322 failed to join ...: accepted
+            if cmd not in (0x4110, 0x4112, 0x4700, 0x4322):
+                print("mgo1-dollgate: lobby %04x (%d bytes) from %s: answered %04x {0}" % (cmd, len(body), me["name"] or "-", cmd + 1), flush=True)
+            out.send((cmd + 1, u32(0)))
+
+
+def serve(port, fn):
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("127.0.0.1", port))
+    srv.listen(32)
+
+    def run(c):
+        try:
+            c.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+            fn(c)
+        except (OSError, ValueError, struct.error) as e:
+            print("mgo1-dollgate: a connection ended: %s" % type(e).__name__, flush=True)
+        finally:
+            try:
+                c.close()
+            except OSError:
+                pass
+    while True:
+        c, _ = srv.accept()
+        threading.Thread(target=run, args=(c,), daemon=True).start()
+
+
+def main(argv):
+    global ARGS
+    p = argparse.ArgumentParser(prog="mgo1-dollgate", description="the lobby of one bot's accountless dolls (127.0.0.1)")
+    p.add_argument("--bot", type=int, required=True)
+    p.add_argument("--gate-port", type=int, default=0)
+    p.add_argument("--lobby-port", type=int, default=0)
+    p.add_argument("--host-addr", default="")
+    p.add_argument("--host-port", type=int, default=0)
+    p.add_argument("--game-file", default="")
+    p.add_argument("--status", default="")
+    p.add_argument("--log-dir", default="")
+    p.add_argument("--state-root", default="/var/lib/mgo1host")
+    ARGS = p.parse_args(argv)
+    if not 1 <= ARGS.bot <= 10:
+        p.error("--bot: 1 to 10")
+    ARGS.gate_port = ARGS.gate_port or 5758 + 2 * ARGS.bot
+    ARGS.lobby_port = ARGS.lobby_port or ARGS.gate_port + 1
+    ARGS.host_port = ARGS.host_port or 5729 + ARGS.bot
+    ARGS.host_addr = ARGS.host_addr or default_address()
+    ARGS.game_file = ARGS.game_file or "/etc/mgo1host/bot%d.game" % ARGS.bot
+    threads = []
+    for port, fn in ((ARGS.gate_port, gate), (ARGS.lobby_port, lobby)):
+        t = threading.Thread(target=serve, args=(port, fn), daemon=True)
+        threads.append(t)
+        t.start()
+    time.sleep(0.5)
+    if not all(t.is_alive() for t in threads):
+        say("bot %d: 127.0.0.1:%d or :%d is taken: no lobby for the accountless dolls" % (ARGS.bot, ARGS.gate_port, ARGS.lobby_port), "E")
+        return 1
+    say("bot %d: the accountless dolls' lobby on 127.0.0.1:%d (gate) and :%d, user ids %#x to %#x, the game at %s:%d"
+        % (ARGS.bot, ARGS.gate_port, ARGS.lobby_port, ID_BASE + 1, ID_BASE + MAX_DOLLS, ARGS.host_addr, ARGS.host_port))
+    while all(t.is_alive() for t in threads):
+        time.sleep(5)
+    say("bot %d: a listener stopped" % ARGS.bot, "E")
+    return 1
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except KeyboardInterrupt:
+        sys.exit(0)

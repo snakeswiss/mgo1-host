@@ -1,0 +1,186 @@
+# code reached only through data: thread entries seen in CreateThread
+0x100024 crt0: the ELF's entry (its loader jumps there after the inflate)
+0x201b08 _init (.init after the text: the constructors, crt0 calls it)
+0x201b2c _fini (.fini: crt0 registers it with atexit)
+0x59a448 card manager worker thread (NewMcActor), gp 0x2809f0
+0x606d08 thread started and terminated at init (network module)
+0x1237a8 GV pad record update (pad, raw): status +0, press +0x14, release +0x18
+# act / die entries passed to GV_SetNamedActor (constants before each call)
+0x348598
+0x3487a8
+0x349170
+0x3491c0
+0x349c18
+0x349dc8
+0x34c5a8
+0x34c790
+0x34d3b8
+0x34e058
+0x34e188
+0x34e5b0
+0x34fd00
+0x34feb0
+0x350a78
+0x350c00
+0x351988
+0x354200
+0x354468
+0x357a88
+0x358cd8
+0x359b28
+0x359c88
+0x35e6e0
+0x35ea58
+0x360170
+0x3602b8
+0x362310
+0x3657e8
+0x365948
+0x366c28
+0x367670
+0x368e60
+0x368fd0
+0x369f68
+0x36ae08
+0x36b050
+0x36b580
+0x36c360
+0x36d738
+0x36e288
+0x370e90
+0x371920
+0x371f20
+0x37d8d0
+0x3807e0
+0x383c38
+0x388be4
+0x388c4c
+0x392888
+0x392980
+0x3971d0
+0x397260
+0x3983e0
+0x3987a0
+0x39b7e8
+0x39b880
+0x39bff8
+0x39c718
+0x39d3a0
+0x39d7f8
+0x39e338
+0x3a3c70
+0x3a3ca8
+0x3a4498
+0x3a44d8
+0x3a53f0
+0x3a5470
+# handlers of the overlay command / class table (0x2DA698)
+0x384048 [0f3d40]
+0x349778 [0f6a54]
+0x348a18 [0fa91c]
+0x383fe8 [1e226c]
+0x384188 [246285]
+0x3498f8 [27b5ee]
+0x3840a8 [28a0fd]
+0x384150 [661f68]
+0x347fd0 [6b237d]
+0x349240 [9474ff]
+0x349668 [9bc19a]
+0x3840e0 [b121a2]
+0x349690 [bcf6ff]
+0x384250 [bf051f]
+0x347f70 [c74f97]
+0x34a7b0 [ccbefe]
+0x384370 [e7a1d7]
+# entries met at run time through pointers (simulation misses)
+0x60c370 newlib allocator entry used by the network configuration load
+0x1812f8 base, called through a pointer (NetConnect)
+0x113fa0 base, called through a pointer (NetConnect)
+0x34fbd8 NetConnect callback
+0x180d08 base, called through a pointer (network connect)
+0x17a1f0 base, called through a pointer (actor setup)
+0x1e8e70 base, called through a pointer (HTTP buffer setup)
+0x5d9a70 overlay, called through a pointer (HTTP library init)
+0x1052e0 base, the boot's USB keyboard actor (sceUsbKbInit + actor 0x104de8)
+0x104de8 base, act of the USB keyboard actor
+0x1e7138 base, usbkb result handler (GET_INFO), table 0x242B50
+0x1e7190 base, usbkb result handler (READ)
+0x1e7708 base, usbkb result handler (3)
+0x1e7758 base, usbkb result handler (4)
+0x1e7778 base, usbkb result handler (5)
+0x5f4a88 overlay, mrdUPnP's thread main (passed to its thread through a pointer)
+0x177288 base, the boot's registration of the configuration blocks 0..17 (table 0x28D528)
+0x173160 base, the boot's online init (blocks, resident actors, TX55 context)
+0x16d8f0 base, the boot's network init (EENet, libeenetctl, event handler, network state)
+# the base's memory pools and stage loading (page data from the archives through cdbios)
+0x120e98 actor memory allocator (pool 0), installed by the GV init
+0x120f40 pool 0 created again (stage change, 0x1034C0)
+0x121170 pool create (pool, start, size)
+0x121bf8 resident area init
+0x121c30 resident mark
+0x121c48 resident reset to the mark
+0x121c60 resident alloc (size, id)
+0x121c90 resident alloc aligned
+0x121cd0 resident objects registered again
+0x121728 pool: largest free block
+0x121770 pool: free size
+0x1217a0 pool block tag
+0x122b30 actor memory list freed
+0x1034c0 stage memory reset (DG, pools, 0x104A90, 0x158000)
+0x106b28 GM_StartLoader(name)
+0x106a60 loader act
+0x106ab8 loader die
+0x106ae0 loader init
+0x101b28 FS stage load request (name)
+0x101c98 FS stage load sync (info)
+0x101ce0 FS stage load complete (info)
+0x17d638 cdbios: the IOP's read callback command
+0x1012f0 archive header read callback
+0x100ce8 archive read callback
+0x101810 stage table read callback
+0x100ab8 file system init (cdbios, archives, stage table)
+0x1013b8 archive stage table read
+0x103418 stage file command handler registration
+0x102588 loader semaphore
+0x1043d0 stage manager (per frame)
+0x104630 stage manager: request check
+0x104898 stage manager: load start
+0x106cc0 next page name (resident first)
+0x106c40 resident page name
+0x106ca0 stage page name
+0x105f00 base, the stream heap init (GM_Init 0x104518), run by the platform's boot
+0x123f88 base, sub-allocator init (the stream heap's, 0x1F00000-0x1F80000)
+0x157fd0 base, boot: the geom loader (type 0x0C) registered with the file system cache
+0x162840 base, boot: the motion loaders (types 8, 9, 0x0A)
+0x1633d0 base, boot: the nav loader (type 0x0F) and its state
+0x16cb48 base, boot: the zon loader (type 0x12)
+0x147ee8 base, DG loader of type 0x0D (mdl), registered by the platform's boot (DG init 0x143E98 is not run)
+0x147fd8 base, DG loader of type 0x10 (cvd)
+0x1277e8 base, DG loader of type 3 (tri)
+0x148018 base, DG loader of type 6 (lt2)
+0x122fe8 base, the file system cache's loader registration (type, handler, flags)
+0x146c20 base, DG init part: its tables (0x288AC0, 0x2D4670), run by the platform's boot
+0x12ac70 base, DG init part: the texture manager's state
+0x127680 base, DG stage reset (0x143E80): the texture blocks back to pool 0 before its reset
+0x104a90 base, stage load reset (0x1034C0)
+0x158000 base, stage load reset of the geom tables (0x1034C0)
+0x120f30 base, stage teardown step (0x103440): the time step back to 5
+0x12b770 base, DG reset step (0x143E28)
+0x146ca8 base, DG reset step (0x143E28)
+0x129640 base, DG reset step (0x143E28)
+0x12ad88 base, DG reset step (0x143E28)
+0x144190 base, the frame rate setting (0 full, 1 half)
+0x162890 base, stage teardown step: motions
+0x1089b8 base, stage teardown step
+0x103530 base, the stage manager's re-init of the subsystems (0x104898)
+0x121d68 base, post-load step (0x104630)
+0x103600 base, post-load: the stage's system actors, DG prim types, node pool
+0x11f318 base, post-load step
+0x11ab90 base, post-load step
+0x11b040 base, post-load step
+# DG's own display path (run by the simulation with SIM_DG=1: the PS2 world draws through its GS)
+0x143e98 DG init: GS reset, display, VBlank handlers, the two DG actors
+0x143cb0 DG frame actor (GV_SetNamedActor in 0x143E98, static work 0x288A20)
+0x143dc0 DG second actor (static work 0x288A60)
+0x143c08 DG VBlank start handler (AddIntcHandler cause 2)
+0x143c98 DG VBlank end handler (cause 3)

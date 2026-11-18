@@ -1,0 +1,6 @@
+# a PLAYABLE DOLL after its log-in (login_account.txt): [Join Game]; the doll itself finds its game in
+# the list (by its name) and presses Circle on it, then [Join Game] Join this game; a locked game's
+# password is typed by the doll when the keyboard opens
+[Quick Join]|Select a rule set=40@200
+[Join Game]|Select a game to join from=2000@30
+[Join Game]|Join this game=2000@20

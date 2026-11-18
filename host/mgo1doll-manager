@@ -1,0 +1,1235 @@
+#!/usr/bin/env python3
+"""mgo1doll-manager: the PLAYABLE DOLLs of this server, kept to their bots' free seats
+(docs/PLAYABLE_DOLL.md). A systemd service (mgo1doll-manager.service); every few seconds:
+
+- the accountless dolls (no account in their settings; none with DOLL_GATE=0 in server.env): doll N plays
+  as DOLL_N, logged in to its bot's own doll lobby (host/mgo1-dollgate). A bot's DOLL_COUNT
+  (/etc/mgo1host/bot<B>.env), when set, is how many it has: the missing ones are added (the first free
+  numbers), the last ones removed;
+- the dolls' names go to /var/lib/mgo1host/dolls.names, which the dolls read: the other names are real
+  players, and a game with dolls only is not played (the dolls wait as spectators until a real player
+  comes). An accountless doll's name is its DOLL_NAME ((v141 beta 5) MGO1 Host.exe's RENAME), else DOLL_<N>; a
+  doll with an account writes the name it plays under into its status file, taken once its identity is known
+  ("identity" not "unknown");
+- for each bot, from its status file (the game's most players, the players in it): the dolls enabled
+  for that bot are started while the game has a seat for them, one seat always left for a real player
+  (KEEP_SEAT=1, the default), the seats of the bot's virtual dolls (its VDOLL_COUNT, the status's vdolls_set) kept
+  for them (docs/VIRTUAL_DOLL.md). A doll started and not in the game yet holds its seat for DOLL_JOIN_TIMEOUT
+  (240 s), then it is started again; (v141 beta 9) 240 s of its own game's time (its status file's frames: a
+  server slowed to a quarter of the game's pace took 4 minutes to bring a doll back, and the timeout started it
+  again a second before it joined, again and again), 20 minutes at most (DOLL_JOIN_TIMEOUT_MAX). When a real player comes into a full game, a doll not in the game
+  yet is stopped first, else the last doll leaves (its `leave` order: it quits the game at once); it
+  comes back when a seat is free again;
+- never more dolls at once than the server's cores and memory allow besides its bots (a doll is a
+  whole game: about half a core and 250 MB);
+- (v141 beta 9) the pace guard: a game with real players whose dolls (half of them at least) or bot ran below the game's
+  pace two minutes in a row (their "pace:" lines in their status files: under 96 % of the VBlanks due, the processors
+  short) gets one doll less (its last doll leaves), held 10 minutes at least (twice as long at each new cut, an hour at
+  most); then one doll more each time its game has kept its pace that long. DOLL_PACE_GUARD=0 in server.env: off;
+- the watchdog: a bot's or a doll's game that has not written its status for 3 minutes (hung), or none
+  for 3 minutes, is started again, and its daily log says so;
+- (v150-host beta 16) the server's processors said: the share its VPS's machine takes of them all, and of the worst one (a
+  game's thread runs on one at a time), two minutes in a row; and a bot whose game runs under 90 % of its pace two minutes
+  in a row while its virtual dolls play (the pace guard takes full dolls away and does nothing for them): a warning in the
+  manager's log and the bot's, with what to do;
+- a doll service running without its settings file is stopped. Every systemctl call has a time limit
+  (MGO1_SYSTEMCTL_TIMEOUT, 30 s) and its failures are logged;
+- (v150-host beta 16) a bot whose playable dolls do not all start: why, in the manager's daily log and the bot's, once a
+  reason and once a day while it lasts (`bot 2: 2 playable dolls set, none can start: its game has 7 seats ...`, `bot 1's
+  playable dolls (2) wait: bot 1 is not running ...`: doll_sums; a warning when a setting must change), and what was
+  counted for each bot in /var/lib/mgo1host/dolls.sums.json (mgo1host-agent's `dolls` counts the same);
+- (v150-host beta 16) the dolls that play at their bot's virtual dolls' level (DOLL_DIFFICULTY=vdoll): each one's level in
+  /var/lib/mgo1host/dolls.levels, which mgo1doll.sh reads at its start; a doll added for a bot's DOLL_COUNT follows them
+  when the bot has virtual dolls set (VDOLL_COUNT above 0, or a VDOLL_LEVEL).
+
+Settings: /etc/mgo1host/doll<N>.env (DOLL_BOT, DOLL_ENABLED, DOLL_ACCOUNT_ID), /etc/mgo1host/bot<B>.env
+(DOLL_COUNT), /etc/mgo1host/server.env (DOLL_KEEP_SEAT=0 to fill every seat, unless the accountless dolls are listed in
+TX-55's game list: DOLL_LIST not off; DOLL_GATE=0: no accountless dolls). Its decisions go to its daily log, /var/log/mgo1host/manager/<YYYY-MM-DD>.log (docs/LOGS.md).
+Nothing here ever logs an account or a password.
+    mgo1doll-manager             the service
+    mgo1doll-manager --counts    the bots' DOLL_COUNT applied once (mgo1host-agent doll-count), then the end
+"""
+import errno, fcntl, json, os, re, shutil, stat, subprocess, sys, time
+
+ETC = os.environ.get('MGO1_ETC', '/etc/mgo1host')
+VAR = os.environ.get('MGO1_VAR', '/var/lib/mgo1host')
+PERIOD = float(os.environ.get('DOLL_MANAGER_PERIOD', '5'))
+START_GAP = float(os.environ.get('DOLL_START_GAP', '20'))     # seconds between two starts (the log-in costs a core)
+LEAVE_WAIT = float(os.environ.get('DOLL_LEAVE_WAIT', '30'))    # seconds a doll told to leave has before it is stopped
+JOIN_WAIT = float(os.environ.get('DOLL_JOIN_TIMEOUT', '240'))  # seconds a started doll has to be in its bot's game
+JOIN_WAIT_MAX = float(os.environ.get('DOLL_JOIN_TIMEOUT_MAX', '1200'))   # (v141 beta 9) and at most, its own game slowed
+STEAL_WARN = 20.0                                            # (v141 beta 9) the processors' share taken by the VPS's machine, %
+STEAL_CORE_WARN = 30.0                                       # (v150-host beta 16) one processor's: a game's thread runs on one at a time
+VDOLL_PACE_SLOW = 0.90                                       # (v150-host beta 16) a bot with virtual dolls in play under 90 % of the VBlanks due
+ROUNDS = int(os.environ.get('DOLL_MANAGER_ROUNDS', '0'))       # (tests: this many rounds, then the end)
+MAX_DOLLS = 64
+MAX_BOTS = 10
+LOG_DIR = os.environ.get('MGO1_LOG_DIR', '/var/log/mgo1host') + '/manager'
+MGO1LOG = os.environ.get('MGO1LOG', '/usr/local/bin/mgo1log')
+HANG_S = float(os.environ.get('MGO1_HANG_SECONDS', '180'))   # a game silent that long is hung
+PACE_HOLD = float(os.environ.get('DOLL_PACE_HOLD', '600'))   # (v141 beta 9) the pace guard's first hold, seconds
+PACE_SETTLE = float(os.environ.get('DOLL_PACE_SETTLE', '120'))   # (and the time a change has to show before the next)
+PACE_SLOW = 0.96                                             # a minute under 96 % of the VBlanks due: slowed
+PACE_COLLAPSE = 0.6                                          # (v141 beta 13) the bot's game a minute under 60 %: at once
+GRACE_S = float(os.environ.get('MGO1_HANG_GRACE', str(HANG_S)))   # (and running at least that long)
+SYSTEMCTL = os.environ.get('MGO1_SYSTEMCTL', 'systemctl')    # (tests: a stand-in)
+SYSTEMCTL_TIMEOUT = float(os.environ.get('MGO1_SYSTEMCTL_TIMEOUT', '30'))
+OWNED_ROOTS = (VAR, os.path.dirname(LOG_DIR))                # the folders the games' user owns (dir_fd, safe_write, safe_read)
+# the states of a unit that has, or is about to have, a game ("unknown": systemctl did not answer, counted so
+# that nothing more is started on a guess)
+RUNNING = ('active', 'activating', 'reloading', 'deactivating', 'unknown')
+# (v141 beta 5) an accountless doll's name in the game (mgo1host-agent's DOLL_NAME_RE)
+DOLL_NAME_RE = re.compile(r'^[A-Za-z0-9._!?+*-][A-Za-z0-9._!?+* -]{1,13}[A-Za-z0-9._!?+*-]$')
+
+# ---- (v150-host beta 16) root's files in the folders the game's user owns ------------------------------------------
+# /var/lib/mgo1host (the bots' run folders, the dolls' folders) and /var/log/mgo1host belong to the user the games run as,
+# and a game reads the internet's datagrams: whoever got to run code as that user must not get root's hands through a
+# symbolic link left where root writes (a doll's `command`, a bot's `cmd.txt`, a .tmp file, a folder itself). Every
+# such file is opened here: each folder below those roots in turn with O_NOFOLLOW, the file itself with O_NOFOLLOW, a
+# plain file with one name only; a new file under a name of its writer's own, then renamed (a rename replaces a link, never
+# what it points to). Reading: the same way, and never waiting on a pipe left there.
+def dir_fd(d, make=False):
+    """A descriptor of folder d; below the game's user's roots, reached through no symbolic link (make: made when missing,
+    the game's user's)."""
+    d = os.path.abspath(d)
+    for root in OWNED_ROOTS:
+        root = os.path.abspath(root)
+        if d != root and not d.startswith(root + os.sep):
+            continue
+        if make and not os.path.isdir(root):
+            os.makedirs(root, exist_ok=True)
+        fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            for part in [p for p in os.path.relpath(d, root).split(os.sep) if p not in ("", ".")]:
+                try:
+                    nfd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+                except FileNotFoundError:
+                    if not make:
+                        raise
+                    os.mkdir(part, 0o755, dir_fd=fd)
+                    nfd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+                    game_owner(nfd)
+                os.close(fd)
+                fd = nfd
+            return fd
+        except BaseException:
+            os.close(fd)
+            raise
+    return os.open(d, os.O_RDONLY | os.O_DIRECTORY)
+
+
+def game_owner(fd):
+    """An open file or folder given to the games' user (mgo1host), when there is one."""
+    try:
+        import grp, pwd
+        os.fchown(fd, pwd.getpwnam("mgo1host").pw_uid, grp.getgrnam("mgo1host").gr_gid)
+    except (KeyError, OSError):
+        pass
+
+
+def safe_write(path, text, mode=0o644, append=False, owner=False, make=False):
+    """A file written by root: whole (a file of this writer's own, then renamed) or one more line (append). Never through
+    a link, never another file's second name; owner: given to the games' user. OSError when it cannot."""
+    d, name = os.path.split(os.path.abspath(path))
+    dfd = dir_fd(d, make)
+    try:
+        tmp = name if append else "%s.%d.tmp" % (name, os.getpid())
+        if not append:
+            try:
+                os.unlink(tmp, dir_fd=dfd)
+            except OSError:
+                pass
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | (os.O_APPEND if append else os.O_EXCL), mode, dir_fd=dfd)
+        try:
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1:
+                raise OSError(errno.EPERM, "not a plain file of its own", path)
+            data = text.encode("utf-8", "replace")
+            while data:
+                data = data[os.write(fd, data):]
+            if not append:
+                os.fchmod(fd, mode)
+            if owner:
+                game_owner(fd)
+        except BaseException:
+            if not append:
+                try:
+                    os.unlink(tmp, dir_fd=dfd)
+                except OSError:
+                    pass
+            raise
+        finally:
+            os.close(fd)
+        if not append:
+            os.replace(tmp, name, src_dir_fd=dfd, dst_dir_fd=dfd)
+    finally:
+        os.close(dfd)
+
+
+def safe_read(path, limit=4 << 20):
+    """A file's text as root reads it from the game's user's folders: a plain file reached through no link, limit bytes at
+    most; None when there is none (or a link, a pipe, a folder)."""
+    try:
+        d, name = os.path.split(os.path.abspath(path))
+        dfd = dir_fd(d)
+        try:
+            fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dfd)
+        finally:
+            os.close(dfd)
+        with os.fdopen(fd, "rb") as f:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                return None
+            return f.read(limit).decode("utf-8", "replace")
+    except OSError:
+        return None
+
+
+FAILED = {}                                        # a file of the manager's -> its last failure's words (write_failed)
+
+
+def write_failed(what, e=None, then=''):
+    """(v150-host beta 16) A file the manager could not write (a full disk, a read-only folder, a link left in its place):
+    said once a cause (an error), not each round; e None: written again, said once too. The manager goes on either way:
+    its watchdog of the bots' games must never stop for a file."""
+    words = None if e is None else str(e.strerror or e)
+    if FAILED.get(what) == words:
+        return
+    FAILED[what] = words
+    if words is None:
+        say('%s: written again' % what)
+    else:
+        say('%s could not be written (%s)%s' % (what, words, ': ' + then if then else ''), 'E')
+
+
+def doll_name(n, e):
+    """An accountless doll's name in the game: its DOLL_NAME when valid, else DOLL_<n>."""
+    v = e.get('DOLL_NAME', '')
+    return v if DOLL_NAME_RE.match(v) and '  ' not in v else 'DOLL_%d' % n
+
+
+def say(text, level='I', also=None):
+    """A decision of the manager's: the journal, its daily log and (also: 'bot1', 'doll3') that one's."""
+    print('mgo1doll-manager: ' + text, flush=True)
+    if os.access(MGO1LOG, os.X_OK):
+        for d in [LOG_DIR] + ([os.path.join(os.path.dirname(LOG_DIR), also)] if also else []):
+            try:
+                subprocess.run([MGO1LOG, '--dir', d, '--note', 'mgo1doll-manager: ' + text, '--level', level, '--quiet'],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
+            except (OSError, subprocess.SubprocessError):
+                pass
+
+
+def systemctl(*args):
+    """A systemctl action within its time limit: True when it was done; a failure is logged."""
+    what = ' '.join(args)
+    try:
+        r = subprocess.run([SYSTEMCTL, *args], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
+                           timeout=SYSTEMCTL_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        say('systemctl %s: no answer in %d s' % (what, SYSTEMCTL_TIMEOUT), 'W')
+        return False
+    except OSError as e:
+        say('systemctl %s: %s' % (what, e), 'E')
+        return False
+    if r.returncode != 0:
+        say('systemctl %s failed (code %d) %s' % (what, r.returncode, ' '.join((r.stderr or '').split())[:200]), 'W')
+        return False
+    return True
+
+
+def states(units):
+    """The units' states in one call ({unit: active, activating, inactive, failed ...}; 'unknown' without an answer)."""
+    if not units:
+        return {}
+    try:
+        r = subprocess.run([SYSTEMCTL, 'is-active', *units], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+                           timeout=SYSTEMCTL_TIMEOUT)
+        lines = (r.stdout or '').split()
+    except (OSError, subprocess.TimeoutExpired):
+        return {u: 'unknown' for u in units}
+    if len(lines) == len(units):
+        return dict(zip(units, lines))
+    out = {}                                       # (a systemctl that answers one unit only: one call each)
+    for u in units:
+        try:
+            r = subprocess.run([SYSTEMCTL, 'is-active', u], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+                               timeout=SYSTEMCTL_TIMEOUT)
+            s = (r.stdout or '').strip()
+            out[u] = s or ('active' if r.returncode == 0 else 'inactive')
+        except (OSError, subprocess.TimeoutExpired):
+            out[u] = 'unknown'
+    return out
+
+
+MISSING = {}                                       # unit -> when its status file was first seen missing
+
+
+def silent_for(path, unit, now):
+    """Seconds since the status file was last written; without one, since it was first seen missing."""
+    try:
+        t = os.path.getmtime(path)
+        MISSING.pop(unit, None)
+        return now - t
+    except OSError:
+        return now - MISSING.setdefault(unit, now)
+
+
+def crash_request(name, what):
+    """(v150-host beta 16) Before a hung game is restarted: the request for its crash report (docs/CRASH_REPORTS.md), left in
+    its log folder as crash/.hung ({"name": the report's file, "what": what happened}). The game's own mgo1log, which holds
+    the game's last lines, takes it when the restart stops it and writes the report. Returns the report's path, None when
+    the game has no log folder (no mgo1log to write one) or the request cannot be written."""
+    folder = os.path.join(os.path.dirname(LOG_DIR), name)
+    if not os.path.isdir(folder):
+        return None
+    crash = os.path.join(folder, 'crash')
+    report = time.strftime('%Y-%m-%d_%H%M%S', time.gmtime()) + '_hung.txt'
+    try:
+        # (the review's P2-1: the log folders are the games' user's; root writes there through no link: a `crash` or a
+        # `.hung` that is a symbolic link is refused and the game is restarted without a report)
+        safe_write(os.path.join(crash, '.hung'), json.dumps({'name': report, 'what': what, 't': time.time()}), 0o644, make=True)
+        fd = dir_fd(crash)
+        try:                                       # (the game's user writes its reports there, as its daily log)
+            st = os.stat(folder)
+            if os.fstat(fd).st_uid != st.st_uid:
+                os.fchown(fd, st.st_uid, st.st_gid)
+        finally:
+            os.close(fd)
+    except OSError:
+        return None
+    return os.path.join(crash, report)
+
+
+def crash_requested(report):
+    """(v150-host beta 16) After the restart: a request the game's logger did not take is removed; True when the report is there."""
+    try:
+        fd = dir_fd(os.path.dirname(report))
+        try:
+            os.unlink('.hung', dir_fd=fd)
+        finally:
+            os.close(fd)
+    except OSError:
+        pass
+    return os.path.isfile(report)
+
+
+# (v150-host beta 16) a bot's game that has written its status and then not for FAST_S is hung (0: HANG_S only). The game
+# writes it every 60 VBlanks (ps2world.cpp HostCommands, StatusWrite: once a second at its pace): 45 s without one is a game
+# under 1.33 VBlanks a second. The server's own days (836 minutes of "pace:" lines, 25 October to 10 November 2026): the
+# slowest minute of a game that played 29.3 VBlanks a second (a status every 2 s), the longest single VBlank 2 s late; the
+# two hung games 1 VBlank in 60 s (their own "pace:" line), restarted after 183 s. A bot's status file is in its run
+# folder, new at each start (mgo1host.sh), so an old one is this game's own; a doll's stays in its folder over its restarts
+# and its boot and log-in take a minute: the dolls keep HANG_S
+# (v150-host beta 18) server.env's HANG_FAST_SECONDS sets it (15 to 600 s; read at each round, as the other server.env keys:
+# no restart of the manager); not there: the manager's own MGO1_HANG_FAST_SECONDS (0: HANG_S only), else 45. A value out of
+# its range (or not a number): said once, the default kept
+FAST_DEFAULT = float(os.environ.get('MGO1_HANG_FAST_SECONDS', '45'))
+FAST_S = FAST_DEFAULT
+FAST_MIN, FAST_MAX = 15, 600
+FAST_SAID = [None]                                 # (the bad value last said)
+
+
+def fast_seconds(senv):
+    """(v150-host beta 18) FAST_S from server.env's HANG_FAST_SECONDS (15 to 600), else the manager's default."""
+    v = senv.get('HANG_FAST_SECONDS', '').strip()
+    if not v:
+        FAST_SAID[0] = None
+        return FAST_DEFAULT
+    if v.isdigit() and FAST_MIN <= int(v) <= FAST_MAX:
+        FAST_SAID[0] = None
+        return float(v)
+    if FAST_SAID[0] != v:
+        FAST_SAID[0] = v
+        say('server.env: HANG_FAST_SECONDS must be %d to %d (seconds): %d' % (FAST_MIN, FAST_MAX, int(FAST_DEFAULT)), 'W')
+    return FAST_DEFAULT
+STALE = {}                                         # unit -> (its status file's time, when the manager first saw it past FAST_S)
+
+
+def stale_seen(unit, status):
+    """True when the manager saw this same status file past FAST_S two periods ago or more (10 s at most), by its own
+    clock: one sight could be the clock's step, or the server frozen with the game and just back."""
+    try:
+        m = os.stat(status).st_mtime_ns
+    except OSError:
+        STALE.pop(unit, None)
+        return False
+    seen, mono = STALE.get(unit), time.monotonic()
+    if seen is None or seen[0] != m:
+        STALE[unit] = (m, mono)
+        return False
+    return mono - seen[1] >= min(10.0, 2 * PERIOD)
+
+
+def watchdog(units, active_since, now):
+    """units: [(unit, status file, log name)] of the running games; a game silent past HANG_S (and
+    running longer than that) is restarted. (v150-host beta 16) Its last lines are kept: its crash report, asked from
+    its own mgo1log before the restart, is named in its daily log; a bot's game whose status file is there and FAST_S
+    old, seen so on the manager's rounds, is restarted without the wait for HANG_S."""
+    for unit, status, name in units:
+        since = active_since.setdefault(unit, now)
+        quiet = silent_for(status, unit, now)
+        fast = FAST_S > 0 and name.startswith('bot') and FAST_S < quiet <= HANG_S and now - since >= min(GRACE_S, FAST_S) \
+            and stale_seen(unit, status)           # (and seen running that long: a restart that fails is not asked every round)
+        if quiet <= FAST_S:
+            STALE.pop(unit, None)
+        if (now - since >= GRACE_S and quiet > HANG_S) or fast:
+            none = not os.path.exists(status)
+            why = 'its game wrote nothing for %d s (%s)' % (int(quiet), 'no status file' if none else 'hung')
+            report = crash_request(name, why + ': restarted by the doll manager')
+            systemctl('restart', unit)
+            active_since[unit] = now
+            MISSING.pop(unit, None)
+            STALE.pop(unit, None)
+            say('%s: %s: started again' % (name, why), 'W', name)
+            if report and crash_requested(report):
+                say('%s: crash report %s (its game\'s last lines before the restart; docs/CRASH_REPORTS.md)' % (name, report), 'W', name)
+            elif report:
+                say('%s: no crash report (its logger wrote none at its stop)' % name, 'W', name)
+
+
+def unquote(v):
+    """(v141 beta 6) A value as systemd's EnvironmentFile gives it to the services: its quotes around it dropped (a doll's
+    DOLL_NAME="SaveMGO_DOLL_1" was SaveMGO_DOLL_1 in the game and not here)."""
+    v = v.strip()
+    if len(v) >= 2 and v[0] == v[-1] and v[0] in '"\'':
+        v = v[1:-1]
+    return v
+
+
+def env_file(path):
+    out = {}
+    try:
+        for line in open(path, encoding='utf-8', errors='replace'):
+            line = line.strip()
+            if not line or line.startswith('#') or '=' not in line:
+                continue
+            k, v = line.split('=', 1)
+            out[k.strip()] = unquote(v)
+    except OSError:
+        pass
+    return out
+
+
+def game_settings(bot):
+    out = {}
+    try:
+        for line in open(f'{ETC}/bot{bot}.game', encoding='utf-8', errors='replace'):
+            m = re.match(r'\s*([a-z_]+)\s*=\s*(.*?)\s*$', line)
+            if m and not line.lstrip().startswith('#'):
+                out[m.group(1)] = m.group(2)
+    except OSError:
+        pass
+    return out
+
+
+def read_json(path):
+    try:
+        return json.loads(safe_read(path))            # (v150-host beta 16: a status file is the game's user's)
+    except (TypeError, ValueError):
+        return None
+
+
+def vdolls_set(status):
+    """A bot's virtual dolls set (its status's vdolls_set, docs/VIRTUAL_DOLL.md), 0 when none or unreadable."""
+    try:
+        return max(0, int((status or {}).get('vdolls_set', 0) or 0))
+    except (AttributeError, TypeError, ValueError):
+        return 0
+
+
+def doll_dir(doll):
+    """The doll's folder, the doll's own (it writes its status there): made for it when missing."""
+    d = f'{VAR}/doll{doll}'
+    try:
+        os.close(dir_fd(d, make=True))
+    except OSError:
+        pass
+    return d
+
+
+def order(doll, text):
+    """An order in the doll's command file, appended (an order of MGO1 Host.exe's may be waiting there). One that cannot be
+    written (a link left in its place, a full disk) is said: the doll is stopped after its time instead."""
+    try:
+        safe_write(f'{VAR}/doll{doll}/command', text + '\n', append=True, make=True)
+    except (OSError, ValueError) as e:
+        say('doll %d: its order "%s" could not be written (%s)' % (doll, text, getattr(e, 'strerror', None) or e), 'W', f'doll{doll}')
+
+
+BOT_COST, DOLL_COST = 0.35, 0.40   # (v141 beta 12) a bot's and a doll's share of a core at the game's full pace (0.27, 0.32 measured)
+VDOLL_COST = 0.03                  # a virtual doll's, in its bot's process (0.024 measured: 15 of them, docs/DEDICATED_HOST.md 17)
+
+
+def steal_since_boot():
+    """(v141 beta 12) The share of the processors the VPS's machine has taken since the server started (/proc/stat), in %."""
+    try:
+        with open(os.environ.get('MGO1_PROC_STAT', '/proc/stat')) as f:
+            v = [int(x) for x in f.readline().split()[1:]]
+        return 100.0 * v[7] / sum(v[:8]) if len(v) > 7 and sum(v[:8]) else 0.0
+    except (OSError, ValueError, IndexError):
+        return 0.0
+
+
+def capacity(active_bots, vdolls=0):
+    """The dolls the server runs at once besides its bots: a doll is a whole game too.
+    (v141 beta 4) a quarter of the cores left free (the Linux system, the agent, the starts and the maps' first moments): a
+    game whose processor is short runs slower than the clock, and every player sees it (the "pace:" lines,
+    docs/DEDICATED_HOST.md). (v141 beta 12) a bot 0.35 of a core and a doll 0.4 (0.6 each before), a doll 250 MB, a bot
+    350 MB; the cores less the share the VPS's machine has taken since the server started (its "steal"). The pace guard
+    takes the dolls a slower server cannot keep at the game's pace. The bots' virtual dolls (their status's vdolls_set): 0.03
+    of a core each in their bot's process, no memory of their own."""
+    mem = int(os.environ.get('MGO1_MEM_MB', '0'))     # (tests: the machine's memory and cores given)
+    try:
+        for line in open('/proc/meminfo') if not mem else ():
+            if line.startswith('MemTotal:'):
+                mem = int(line.split()[1]) // 1024
+    except OSError:
+        pass
+    cores = int(os.environ.get('MGO1_CORES', '0')) or os.cpu_count() or 1
+    cores *= 1.0 - min(80.0, steal_since_boot()) / 100.0
+    cores, left = cores * 0.75 - BOT_COST * active_bots - VDOLL_COST * vdolls, mem - 400 - 350 * active_bots   # what the bots leave
+    return max(0, min(MAX_DOLLS, int(cores / DOLL_COST), int(left / 250)))
+
+
+def doll_frame(n):
+    """A doll's game frame (its status file's, from its game's start) and its last minute's pace (VBlanks a second, due)."""
+    st = read_json(f'{VAR}/doll{n}/status.json') or {}
+    try:
+        frame = int(st.get('frame'))
+    except (TypeError, ValueError):
+        return None, None
+    pace = st.get('pace') or {}
+    try:
+        return frame, (float(pace['rate']), float(pace['due']))
+    except (KeyError, TypeError, ValueError):
+        return frame, None
+
+
+def join_late(n, now, t0, pending_frame):
+    """(v141 beta 9) A doll first missed at t0 is late once its own game ran DOLL_JOIN_TIMEOUT seconds since (its status file's
+    frames: from its game's start when it started again meanwhile), or past DOLL_JOIN_TIMEOUT_MAX of real time; a doll with no
+    frame to read, as before (the time alone). Said once when its game's slowness gives it more time."""
+    if now - t0 > JOIN_WAIT_MAX:
+        return True
+    frame, pace = doll_frame(n)
+    rec = pending_frame.get(n)
+    if frame is None or rec is None or rec['at'] is None:
+        return True
+    ran = frame - rec['at'] if frame >= rec['at'] else frame        # (started again since: its frames from then)
+    if ran >= JOIN_WAIT * 59.94:
+        return True
+    if not rec['said']:
+        rec['said'] = True
+        why = ' (its game at %.1f VBlanks a second, %.2f due)' % pace if pace else ''
+        say('doll %d: not in its bot\'s game %d s after it was missed, its own game %d s%s: it has its own game\'s %d s to come' % (
+            n, int(now - t0), int(ran / 59.94), why, int(JOIN_WAIT)), 'W', f'doll{n}')
+    return False
+
+
+class Steal:
+    """(v141 beta 9) The share of the server's processors its VPS's machine took (/proc/stat's steal) each minute: past
+    STEAL_WARN two minutes in a row, a warning in the manager's daily log (and when it ends). (v150-host beta 16) Each processor's
+    too (the cpu<N> lines): a game's thread runs on one processor at a time, and the steal of that one is a quarter of
+    itself in a 4-processor server's figure (10 November: a bot at 33 VBlanks a second, no warning); the worst
+    processor past STEAL_CORE_WARN two minutes in a row is said the same way."""
+
+    def __init__(self):
+        self.last = None
+        self.at = 0.0
+        self.pct = None
+        self.high = 0
+        self.said = False
+        self.cores = {}              # (v150-host beta 16) processor -> (all its time, its steal) at the last look
+        self.worst = None            # its name ('cpu2') and its steal the last minute, %: the highest
+        self.core_high = 0
+        self.core_said = False
+
+    def read(self):
+        try:
+            with open(os.environ.get('MGO1_PROC_STAT', '/proc/stat')) as f:      # (tests: another file)
+                lines = f.read().split('\n')
+            v = [int(x) for x in lines[0].split()[1:]]
+            cores = {}
+            for line in lines[1:]:
+                w = line.split()
+                if not w or not re.match(r'cpu\d+$', w[0]):
+                    continue
+                c = [int(x) for x in w[1:]]
+                cores[w[0]] = (sum(c[:8]), c[7] if len(c) > 7 else 0)
+            return sum(v[:8]), v[7] if len(v) > 7 else 0, cores
+        except (OSError, ValueError, IndexError):
+            return None
+
+    def text(self):
+        """The last minute's steal for a line: ' (the VPS's machine took 41 % of processor cpu2, 11 % of all)', '' unknown."""
+        if self.pct is None:
+            return ''
+        if self.worst:
+            return ' (the VPS\'s machine took %.0f %% of processor %s, %.0f %% of all)' % (self.worst[1], self.worst[0], self.pct)
+        return ' (the VPS\'s machine took %.0f %% of the processors)' % self.pct
+
+    def look(self, now):
+        if now - self.at < 60 and self.last is not None:
+            return
+        cur = self.read()
+        if cur is None:
+            return
+        if self.last is not None and cur[0] > self.last[0]:
+            self.pct = 100.0 * (cur[1] - self.last[1]) / (cur[0] - self.last[0])
+            self.high = self.high + 1 if self.pct >= STEAL_WARN else 0
+            if self.high >= 2 and not self.said:
+                self.said = True
+                say('the server\'s processors: %.0f %% of their time taken by the machine under the VPS (its "steal") 2 minutes in a row: '
+                    'every bot and doll slower than the game\'s clock (docs/DEDICATED_HOST.md, "Lag")' % self.pct, 'W')
+            elif self.said and self.pct < STEAL_WARN / 2:
+                self.said = False
+                say('the server\'s processors: the VPS\'s machine takes %.0f %% of their time again' % self.pct)
+            # (v150-host beta 16) the worst processor's own steal
+            per = [(100.0 * (c[1] - self.cores[n][1]) / (c[0] - self.cores[n][0]), n) for n, c in cur[2].items()
+                   if n in self.cores and c[0] > self.cores[n][0]]
+            self.worst = (max(per)[1], max(per)[0]) if per else None
+            self.core_high = self.core_high + 1 if self.worst and self.worst[1] >= STEAL_CORE_WARN else 0
+            if self.core_high >= 2 and not self.core_said and not self.said:
+                self.core_said = True
+                say('the server\'s processor %s: %.0f %% of its time taken by the machine under the VPS (its "steal") 2 minutes in a row '
+                    '(all %d processors: %.0f %%): the game whose thread runs on it is slower than the game\'s clock, the others '
+                    'may not be (mpstat -P ALL 5; docs/DEDICATED_HOST.md, "Lag")' % (self.worst[0], self.worst[1], len(cur[2]), self.pct), 'W')
+            elif self.core_said and (not self.worst or self.worst[1] < STEAL_CORE_WARN / 2):
+                self.core_said = False
+                say('the server\'s processors: the VPS\'s machine takes %.0f %% of the worst one\'s time again' % (self.worst[1] if self.worst else 0.0))
+        self.last, self.at, self.cores = cur, now, cur[2]
+
+
+class VdollPace:
+    """(v150-host beta 16) A bot whose game runs under VDOLL_PACE_SLOW of its pace two minutes in a row while its virtual dolls play (they
+    are players of its own process: the pace guard, which takes full dolls away, does nothing for them): a warning in the
+    manager's daily log and the bot's, once a spell, with what to do; a line when its pace is back two minutes in a row."""
+
+    def __init__(self):
+        self.st = {}                 # bot -> {'n': the last pace line read, 'slow': the last minutes' [slow, rate, due, cpu], 'said'}
+
+    def look(self, bot, status, steal):
+        g = self.st.setdefault(bot, {'n': None, 'slow': [], 'said': False})
+        pace = (status or {}).get('pace') or {}
+        try:
+            n, rate, due = int(pace['n']), float(pace['rate']), float(pace['due'])
+        except (KeyError, TypeError, ValueError):
+            return
+        if g['n'] == n:
+            return
+        if g['n'] is not None and n < g['n']:                  # (its game started again: its lines from 1)
+            g['slow'], g['said'] = [], False
+        g['n'] = n
+        vd = [v for v in (status.get('vdolls') or []) if isinstance(v, dict)]
+        playing = [v for v in vd if v.get('state') == 'in_game' and v.get('life') in ('spawned', 'alive', 'dead')]
+        real = int(status.get('players_real') or 0)
+        g['slow'] = (g['slow'] + [[bool(playing) and due > 0 and rate < VDOLL_PACE_SLOW * due, rate, due, pace.get('cpu')]])[-2:]
+        two = len(g['slow']) == 2 and g['slow'][0][0] and g['slow'][1][0]
+        if two and not g['said']:
+            g['said'] = True
+            cpu = (', its process at %.0f %% of a core' % float(g['slow'][1][3])) if isinstance(g['slow'][1][3], (int, float)) else ''
+            fewer = max(0, len(playing) - 1)
+            say('bot %d: its game at %.1f then %.1f VBlanks a second (%.2f due) with %d virtual doll(s) and %d real player(s) in '
+                'play%s%s: this server gives its game too little processor for that many players, every player sees it slow. '
+                'Now: mgo1host-agent vdoll-count %d %d (one virtual doll less, no restart; VDOLL_COUNT in bot%d.env for its next '
+                'games). Then: mpstat -P ALL 5 while a game is played (%%steal of one processor), CPU_PIN=1 in server.env tried '
+                'for one game, or a server with dedicated cores (docs/DEDICATED_HOST.md, "Lag")'
+                % (bot, g['slow'][0][1], g['slow'][1][1], due, len(playing), real, cpu, steal.text() if steal else '', bot, fewer, bot),
+                'W', f'bot{bot}')
+        elif g['said'] and len(g['slow']) == 2 and not g['slow'][0][0] and not g['slow'][1][0]:
+            g['said'] = False
+            say('bot %d: its game at its pace again (%.1f VBlanks a second, %.2f due)' % (bot, rate, due), 'I', f'bot{bot}')
+
+
+class PaceGuard:
+    """(v141 beta 9) The pace guard (docs/DEDICATED_HOST.md, "Lag"): per bot, the dolls its game may have while its dolls or
+    the bot itself run slower than the game's clock (the processors short: every player sees it, the dolls' moves, deaths and
+    respawns late, the round's clock). Its state in /var/lib/mgo1host/pace_guard.json (kept across the manager's restarts)."""
+
+    def __init__(self):
+        self.path = f'{VAR}/pace_guard.json'
+        self.st = read_json(self.path) or {}
+
+    def save(self):
+        try:
+            safe_write(self.path, json.dumps(self.st), make=True)
+        except OSError:
+            pass
+
+    def cap(self, bot):
+        """The most dolls the bot's game may have now (None: no cap)."""
+        return self.st.get(str(bot), {}).get('cap')
+
+    def wait(self, bot, now):
+        """(v150-host beta 16) The seconds before the bot's cap may rise at the soonest (its hold from the cut, and from
+        when its game has kept its pace: from now when it does not), 0 with no cap."""
+        g = self.st.get(str(bot)) or {}
+        if g.get('cap') is None:
+            return 0
+        try:
+            hold = float(g.get('hold') or 0)
+            return int(max(0.0, hold - (now - float(g.get('at') or 0)), hold - (now - float(g['ok_since'])) if g.get('ok_since') else hold))
+        except (TypeError, ValueError):
+            return 0
+
+    def look(self, bot, units, dolls_in, real, now, steal=None):
+        """units: {name: status file} of the bot ('bot<B>') and of its dolls in its game; dolls_in: how many of its dolls are in it;
+        real: its real players. A new minute of each read; the cap lowered or raised (a line in the daily log when it changes)."""
+        g = self.st.setdefault(str(bot), {'cap': None, 'at': 0, 'hold': 0, 'ok_since': None, 'seen': {}, 'slow': {}})
+        changed = False
+        for name, path in units.items():
+            pace = (read_json(path) or {}).get('pace') or {}
+            try:
+                n, rate, due = int(pace['n']), float(pace['rate']), float(pace['due'])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if g['seen'].get(name) == n:
+                continue
+            g['seen'][name] = n
+            g['slow'][name] = (g['slow'].get(name, []) + [[rate < PACE_SLOW * due, round(rate, 2), round(due, 2)]])[-3:]
+            changed = True
+        for name in [x for x in g['slow'] if x not in units]:
+            g['slow'].pop(name, None)
+            g['seen'].pop(name, None)
+        two = {x: v for x, v in g['slow'].items() if len(v) >= 2 and v[-1][0] and v[-2][0]}
+        host = f'bot{bot}'
+        # (v141 beta 13) the bot's game a minute under PACE_COLLAPSE of its pace (a VPS whose machine freezes its processors:
+        # every game behind never idles again and stays there): one doll less at once
+        sharp = host in g['slow'] and g['slow'][host][-1][1] < PACE_COLLAPSE * g['slow'][host][-1][2]
+        if sharp and host not in two:
+            two[host] = g['slow'][host]
+        dolls_slow = sorted(x for x in two if x != host)
+        # (the bot slowed: whatever its players, its game's pace is the room's; its dolls slowed: with a real player in)
+        trigger = dolls_in > 0 and (host in two or (real > 0 and len(dolls_slow) >= max(1, (dolls_in + 1) // 2)))
+        floor = 0 if host in two else 1
+        if trigger and now - g['at'] >= PACE_SETTLE and dolls_in > floor:
+            g['cap'] = dolls_in - 1
+            g['at'] = now
+            g['hold'] = min(3600.0, g['hold'] * 2 if g['hold'] else PACE_HOLD)
+            g['ok_since'] = None
+            rates = ', '.join('%s %.1f' % (x, g['slow'][x][-1][1]) for x in ([host] if host in two else []) + dolls_slow)
+            due = g['slow'][dolls_slow[0] if dolls_slow else host][-1][2]
+            why = '; the VPS\'s machine took %.0f %% of the processors' % steal if steal is not None and steal >= 5 else ''
+            how = 'a minute far below its pace' if sharp and len(g['slow'][host]) < 2 or (sharp and not g['slow'][host][-2][0]) else 'below its pace 2 minutes in a row'
+            say('pace guard: bot %d\'s game %s (%s VBlanks a second, %.2f due; the processors short%s): '
+                'one doll less, %d at most, for %d minutes at least' % (bot, how, rates, due, why, g['cap'], int(g['hold'] / 60)), 'W', host)
+            g['slow'] = {}
+            changed = True
+        elif g['cap'] is not None:
+            # (every one of them read at its pace since the cut, that long: one doll more)
+            vals = [g['slow'].get(x) for x in units]
+            if any(v and v[-1][0] for v in vals):
+                g['ok_since'] = None
+            elif vals and all(vals):
+                g['ok_since'] = g['ok_since'] or now
+                if now - g['ok_since'] >= g['hold'] and now - g['at'] >= g['hold']:
+                    g['cap'] += 1
+                    g['at'] = now
+                    g['ok_since'] = now
+                    say('pace guard: bot %d\'s game at its pace %d minutes: one doll more, %d at most' % (bot, int(g['hold'] / 60), g['cap']), 'I', host)
+                    changed = True
+        if changed:
+            self.save()
+
+    def lift(self, bot, enabled):
+        """The cap gone once it reaches the dolls enabled for the bot."""
+        g = self.st.get(str(bot))
+        if g and g.get('cap') is not None and g['cap'] >= enabled:
+            g['cap'] = None
+            g['hold'] = 0
+            say('pace guard: bot %d\'s game: no cap any more' % bot, 'I', f'bot{bot}')
+            self.save()
+
+
+def game_max_players(b):
+    """A bot's game's max_players (its settings file; 9 when it has none: 8 players and the host)."""
+    try:
+        for line in open(f'{ETC}/bot{b}.game', encoding='utf-8', errors='replace'):
+            m = re.match(r'\s*max_players\s*=\s*(\d+)', line)
+            if m:
+                return max(2, min(16, int(m.group(1))))
+    except OSError:
+        pass
+    return 9
+
+
+def join_diag(d, expected, players, waited, account_names):
+    """(v141 beta 6) The join timeout's line: the name looked for, the host's players (names, kinds, dolls' numbers), the doll's
+    own status (its name, how it knows its slot, its activity, its age). A doll with an account: its names never written
+    (account_names: the names of those dolls, shown as their numbers)."""
+    n = d['n']
+    st = read_json(f'{VAR}/doll{n}/status.json') or {}
+    try:
+        age = '%d s old' % (time.time() - os.path.getmtime(f'{VAR}/doll{n}/status.json'))
+    except OSError:
+        age = 'none'
+
+    def shown(name):
+        k = account_names.get((name or '').upper())
+        return '<doll %d, an account>' % k if k else (name or '?')
+    host = ', '.join('%s%s' % (shown(p.get('name', '')), ' (%s%s)' % (p['kind'], ' %d' % p['doll'] if p.get('doll') else '') if 'kind' in p else '')
+                     for p in players) or 'none'
+    own = 'not logged (an account)' if d['account'] else str(st.get('name', '?'))
+    return ('expected %s (%s), the host\'s players [%s]; the doll\'s status (%s): name %s, identity %s, activity %s, real players %s; '
+            'waiting %d s' % ('<its account\'s name>' if d['account'] else '%s (DOLL_NAME %r)' % (expected or '?', d.get('name_set', '')),
+                              'with an account' if d['account'] else 'accountless', host, age, own,
+                              st.get('identity', '?'), st.get('act', '?'), st.get('real_players', st.get('real', '?')), waited))
+
+
+def doll_sums(bot, exists, unit, state, most, real, vset, keep_seat, dolls_set, no_gate, budget, capacity, cap, cap_wait, dolls_in):
+    """(v150-host beta 16) One bot's playable dolls: how many may play now (want) and, when fewer than those set, why: a code
+    (bot_stopped, not_hosting, seats, server_full, pace_guard, gate_off), its words for the daily log and their level (W: a
+    setting the owner must change). exists: the bot's settings file is there; unit: its service's state; state: its
+    status's; most: its game's players, the host one of them; real: the real players in it; vset: its virtual dolls wanted
+    (its status's vdolls_set); dolls_set: its dolls with DOLL_ENABLED=1, no_gate of them accountless while DOLL_GATE=0;
+    budget: the dolls the server can still run, capacity: in all; cap, cap_wait: the pace guard's most for the bot (None:
+    none) and the seconds before one more at the soonest; dolls_in: its dolls in its game now.
+    mgo1host-agent's doll_sums is the same sum (its `dolls`: each bot's waiting_code ...; tests/test_doll_manager.py part 24
+    gives both the same folders and compares)."""
+    seats = max(0, most - 1)                              # the dedicated host takes one
+    kept = 1 if keep_seat else 0
+    vres = max(0, min(vset, seats - kept))                # its virtual dolls hold their seats (docs/VIRTUAL_DOLL.md 6)
+    hosting = exists and unit == 'active' and state == 'hosting'
+    if not hosting:
+        real = dolls_in = 0
+    free = max(0, seats - real - vres - kept)
+    can = dolls_set - no_gate
+    want = min(can, free, budget) if hosting else 0
+    if cap is not None:
+        want = min(want, cap)
+    want = max(0, want)
+    code, why, level, sig = '', '', 'I', None
+    if dolls_set and want < dolls_set:
+        s = '' if dolls_set == 1 else 's'
+        wait = "bot %d's playable doll%s (%d) wait%s: " % (bot, s, dolls_set, 's' if dolls_set == 1 else '')
+        some = 'bot %d: %d playable doll%s set, %s can start: ' % (bot, dolls_set, s, 'only %d' % want if want else 'none')
+        head = some if want else wait
+        fit = max(0, seats - vres - kept)                 # the most that ever play, with no real player in
+        if can == 0:                                      # (none of them may play, whatever its bot does)
+            code, level = 'gate_off', 'W'
+            why = wait + 'no account, and DOLL_GATE=0 in server.env (no accountless doll on this server)'
+        elif not exists:
+            code, level, sig = 'bot_stopped', 'W', (False, '')
+            why = wait + 'there is no bot %d on this server (their DOLL_BOT: remove them, or give them another bot)' % bot
+        elif unit not in RUNNING or unit == 'deactivating':
+            code, level, sig = 'bot_stopped', 'W', (True, unit)
+            why = wait + 'bot %d is not running (its service is %s)' % (bot, unit)
+        elif not hosting:
+            code = 'not_hosting'
+            why = wait + 'its game is not hosting yet (%s)' % ('its service is %s' % unit if unit != 'active' else
+                                                                'state %s' % state if state else 'no status yet')
+        elif want == free:
+            code, sig = 'seats', (seats, vres, kept, fit < can)
+            why = some + 'its game has %d seat%s (max_players %d)%s%s%s' % (
+                seats, '' if seats == 1 else 's', most, ', %d for its virtual dolls' % vres if vres else '',
+                ', 1 kept for a real player' if kept else '', ', %d real player%s' % (real, '' if real == 1 else 's') if real else '')
+            if fit < can:                                 # (its settings alone: never all of them, whoever plays)
+                level = 'W'
+                why += '; %s whatever the players (more max_players or fewer virtual dolls)' % (
+                    'only %d of them can ever play' % fit if fit else 'none of them can ever play')
+        elif want == budget:
+            code, level = 'server_full', 'W' if capacity <= 0 else 'I'
+            why = head + 'the server can run %d %sdoll%s now (%d in all besides its bots and their virtual dolls)' % (
+                budget, 'more ' if capacity > budget else '', '' if budget == 1 else 's', capacity)
+        elif cap is not None and want == cap:
+            code = 'pace_guard'
+            why = head + 'the pace guard allows %d%s (its game ran below its pace; DOLL_PACE_GUARD=0 in server.env: no guard)' % (
+                cap, ' for %d more minute%s at least' % ((cap_wait + 59) // 60, '' if (cap_wait + 59) // 60 == 1 else 's') if cap_wait > 0 else '')
+        else:
+            code, level = 'gate_off', 'W'
+            why = some + '%d of them have no account, and DOLL_GATE=0 in server.env' % no_gate
+    return {'want': want, 'code': code, 'why': why, 'level': level, 'sig': (code, want == 0, dolls_set, sig) if code else None,
+            'seats': seats, 'real': real, 'vdolls': vres, 'kept': kept, 'free_for_dolls': free, 'dolls_set': dolls_set,
+            'dolls_in': dolls_in, 'pace_cap': cap, 'pace_wait_s': int(cap_wait) if cap is not None else 0}
+
+
+SUMS_KEYS = ('seats', 'real', 'vdolls', 'kept', 'free_for_dolls', 'dolls_set', 'dolls_in', 'pace_cap', 'pace_wait_s')
+
+
+def gate_on():
+    """The accountless dolls (host/mgo1-dollgate), unless server.env says DOLL_GATE=0."""
+    return env_file(f'{ETC}/server.env').get('DOLL_GATE', '1') != '0'
+
+
+def dolls(accountless):
+    out = []
+    for n in range(1, MAX_DOLLS + 1):
+        path = f'{ETC}/doll{n}.env'
+        if not os.path.exists(path):
+            continue
+        e = env_file(path)
+        try:
+            bot = int(e.get('DOLL_BOT', '1'))
+        except ValueError:
+            bot = 1
+        account = bool(e.get('DOLL_ACCOUNT_ID'))
+        on = e.get('DOLL_ENABLED', '1') == '1'       # (set to play; enabled: and may, an accountless one with DOLL_GATE=0 not)
+        out.append({'n': n, 'bot': bot, 'account': account, 'name': '' if account else doll_name(n, e),
+                    'name_set': '' if account else e.get('DOLL_NAME', ''), 'on': on,
+                    'enabled': on and (account or accountless), 'follow': e.get('DOLL_DIFFICULTY') == 'vdoll'})
+    return out
+
+
+# (v150-host beta 16) a doll's difficulty following its bot's virtual dolls' level (DOLL_DIFFICULTY=vdoll)
+VDOLL_LEVEL_RE = re.compile(r'^([1-9]|10)(,([1-9]|10)){0,14}$')
+
+
+def vdoll_levels(bot):
+    """A bot's virtual dolls' levels as its game takes them (mgo1host.sh): its VDOLL_LEVEL, 1 to 10 or one a doll (the last
+    for the rest), else the game's own 5."""
+    v = re.sub(r'\s', '', env_file(f'{ETC}/bot{bot}.env').get('VDOLL_LEVEL', ''))
+    return v if VDOLL_LEVEL_RE.match(v) else '5'
+
+
+def follow_levels(ds):
+    """The levels of the dolls that follow their bot's virtual dolls, for /var/lib/mgo1host/dolls.levels (mgo1doll.sh reads
+    it: a doll's own user reads neither its bot's settings nor the other dolls'): a line a doll, `<doll> <level> <bot>
+    <the bot's VDOLL_LEVEL>`. The k-th of a bot's dolls set to play (DOLL_ENABLED=1), in their numbers' order, takes the k-th
+    level of the list, the last for the rest (as the bot's virtual dolls do)."""
+    out, lists = '', {}
+    for d in ds:
+        if d['follow']:
+            lv = lists.setdefault(d['bot'], vdoll_levels(d['bot'])).split(',')
+            k = len([x for x in ds if x['bot'] == d['bot'] and x['on'] and x['n'] < d['n']])
+            out += '%d %s %d %s\n' % (d['n'], lv[min(k, len(lv) - 1)], d['bot'], lists[d['bot']])
+    return out
+
+
+# ---- a bot's DOLL_COUNT: its accountless dolls added or removed (under a lock: mgo1host-agent runs it too) ----
+def write_private(path, text):
+    tmp = path + '.tmp'
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, 'w') as f:
+        f.write(text)
+    os.replace(tmp, path)
+
+
+def doll_counts(accountless, unit_states=None):
+    """True when a doll was added or removed."""
+    if not accountless:
+        return False
+    try:
+        lock = open(f'{ETC}/.dolls.lock', 'a')
+        fcntl.flock(lock, fcntl.LOCK_EX)
+    except OSError:
+        return False
+    changed = False
+    # (v141 beta 5) mgo1host-agent doll-count's name for the doll it adds (MGO1 Host.exe: the next doll's name)
+    new_name, new_bot = os.environ.get('MGO1_DOLL_NEW_NAME', ''), os.environ.get('MGO1_DOLL_NEW_BOT', '')
+    if not (DOLL_NAME_RE.match(new_name) and '  ' not in new_name):
+        new_name = ''
+    try:
+        ds = dolls(accountless)
+        busy = None                                # the numbers whose service still runs (asked once, when needed)
+        for b in range(1, MAX_BOTS + 1):
+            if not os.path.exists(f'{ETC}/bot{b}.env'):
+                continue
+            benv = env_file(f'{ETC}/bot{b}.env')
+            v = benv.get('DOLL_COUNT', '')
+            if not v.isdigit():
+                continue
+            # (v150-host beta 16) a new doll of a bot that has virtual dolls set (VDOLL_COUNT above 0, or a VDOLL_LEVEL) plays at
+            # their level (DOLL_DIFFICULTY=vdoll: mgo1doll.sh), else at 3 as before
+            vc = benv.get('VDOLL_COUNT', '')
+            level = 'vdoll' if (vc.isdigit() and int(vc) > 0) or 'VDOLL_LEVEL' in benv else '3'
+            # (v141) no more than its game takes: its max_players less the host, less its dolls with an account
+            acc = len([d for d in ds if d['bot'] == b and d['account']])
+            want = min(int(v), MAX_DOLLS, max(0, game_max_players(b) - 1 - acc))
+            mine = sorted(d['n'] for d in ds if d['bot'] == b and not d['account'])
+            while len(mine) > want:
+                n = mine.pop()
+                systemctl('stop', f'mgo1doll@{n}')
+                try:
+                    os.remove(f'{ETC}/doll{n}.env')
+                except OSError:
+                    pass
+                shutil.rmtree(f'{VAR}/doll{n}', ignore_errors=True)
+                ds = [d for d in ds if d['n'] != n]
+                changed = True
+                say('doll %d: removed (bot %d has DOLL_COUNT=%d)' % (n, b, want))
+            while len(mine) < want:
+                if busy is None:
+                    st = unit_states or states([f'mgo1doll@{k}' for k in range(1, MAX_DOLLS + 1)])
+                    busy = {k for k in range(1, MAX_DOLLS + 1) if st.get(f'mgo1doll@{k}', 'inactive') in RUNNING}
+                taken = {d['n'] for d in ds} | busy
+                free = [k for k in range(1, MAX_DOLLS + 1) if k not in taken]
+                if not free:
+                    say('bot %d: DOLL_COUNT=%d, but the %d dolls of the server are taken' % (b, want, MAX_DOLLS), 'W')
+                    break
+                n = free[0]
+                name = new_name if new_name and new_bot == str(b) else ''
+                new_name = '' if name else new_name
+                try:
+                    write_private(f'{ETC}/doll{n}.env', '# PLAYABLE DOLL %d: accountless (DOLL_%d), for bot %d (DOLL_COUNT)\n'
+                                  '%sDOLL_BOT=%d\nDOLL_DIFFICULTY=%s\nDOLL_ADAPT=1\nDOLL_TEAM=auto\nDOLL_ENABLED=1\n'
+                                  % (n, n, b, 'DOLL_NAME=%s\n' % name if name else '', b, level))
+                    write_failed(f'{ETC}/doll<N>.env')
+                except OSError as e:                       # (tried again at the next round)
+                    write_failed(f'{ETC}/doll<N>.env', e, 'bot %d\'s DOLL_COUNT=%d not reached, no doll added' % (b, want))
+                    break
+                doll_dir(n)
+                ds.append({'n': n, 'bot': b, 'account': False, 'name': name or 'DOLL_%d' % n, 'enabled': True})
+                mine.append(n)
+                changed = True
+                say('doll %d: added for bot %d as %s (bot %d has DOLL_COUNT=%d)' % (n, b, name or 'DOLL_%d' % n, b, want))
+    finally:
+        fcntl.flock(lock, fcntl.LOCK_UN)
+        lock.close()
+    return changed
+
+
+def say_why(bot, sums, said):
+    """(v150-host beta 16) Why a bot's playable dolls do not all start (doll_sums): a line in the manager's daily log and the
+    bot's each time the reason changes, and once each day while it lasts (every day's log tells it)."""
+    key = (sums['sig'], time.strftime('%Y-%m-%d', time.gmtime())) if sums['sig'] else None
+    if key and said.get(bot) != key:
+        say(sums['why'], sums['level'], f'bot{bot}')
+    said[bot] = key
+
+
+def main():
+    global FAST_S
+    last_start = -1e9
+    rounds = 0
+    leaving = {}                     # doll -> time its leave order was given
+    names_written = None
+    levels_written = None            # (v150-host beta 16) dolls.levels: the dolls that follow their bot's virtual dolls' level
+    said_budget = None
+    said_same = None
+    active_since = {}                # unit -> when the manager first saw it running (the watchdog)
+    pending_since = {}               # doll -> when it was first seen running and not in its bot's game
+    pending_frame = {}               # (v141 beta 9) doll -> its game's frame then (its status file), the slowest it ran since
+    start_failed = {}                # doll -> when its start failed (another one is tried meanwhile)
+    said_why = {}                    # (v150-host beta 16) bot -> the reason last said for its dolls not started (say_why)
+    sums_written, sums_at = None, 0.0
+    guard = PaceGuard()              # (v141 beta 9) the pace guard
+    steal = Steal()                  # (v141 beta 9) the share of the processors the VPS's machine takes
+    vpace = VdollPace()              # (v150-host beta 16) a bot slowed while its virtual dolls play: said
+    say('started (%d dolls set up)' % len(dolls(gate_on())))
+    while True:
+        accountless = gate_on()
+        senv = env_file(f'{ETC}/server.env')
+        FAST_S = fast_seconds(senv)                  # (v150-host beta 18) the watchdog's delay for a silent bot
+        # changed live (MGO1 Host.exe); (v141 beta 3) the dolls listed in TX-55's game list: a seat always kept (the list
+        # would show the game full, no real player could come in)
+        keep_seat = senv.get('DOLL_KEEP_SEAT', '1') != '0' or (senv.get('DOLL_GATE', '1') != '0' and senv.get('DOLL_LIST', 'host') != 'off')
+        listed = senv.get('DOLL_LIST', 'host') != 'off'    # (v150-host beta 16: the virtual dolls are listed so with DOLL_GATE=0 too)
+        units = [f'mgo1host@{b}' for b in range(1, MAX_BOTS + 1)] + [f'mgo1doll@{n}' for n in range(1, MAX_DOLLS + 1)]
+        st = states(units)
+        now = time.time()
+
+        def running(unit):
+            return st.get(unit, 'unknown') in RUNNING
+        # (v150-host beta 16) the watchdog first: nothing later in a round (a file that cannot be written, a full disk) may
+        # keep a hung game from its restart
+        ds = dolls(accountless)
+        bots_on = [b for b in range(1, MAX_BOTS + 1) if os.path.exists(f'{ETC}/bot{b}.env') and running(f'mgo1host@{b}')]
+        running_units = [(f'mgo1host@{b}', f'{VAR}/bot{b}/run/status.json', f'bot{b}') for b in bots_on
+                         if st.get(f'mgo1host@{b}') == 'active'] + \
+                        [(f'mgo1doll@{d["n"]}', f'{VAR}/doll{d["n"]}/status.json', f'doll{d["n"]}') for d in ds
+                         if st.get(f'mgo1doll@{d["n"]}') == 'active']
+        for u in [u for u in active_since if u not in {x[0] for x in running_units}]:
+            active_since.pop(u, None)
+            MISSING.pop(u, None)
+        watchdog(running_units, active_since, now)
+        if doll_counts(accountless, st):
+            st = states(units)
+        ds = dolls(accountless)
+        # the dolls' names: an accountless doll's is its DOLL_NAME, else DOLL_<N>; another's from its status file once
+        # its identity is known, kept in /var/lib/mgo1host/doll<N>/name
+        name_of, by_name = {}, {}
+        for d in ds:
+            if not d['account']:
+                nm = d['name']
+            else:
+                s = read_json(f'{VAR}/doll{d["n"]}/status.json') or {}
+                nm = str(s.get('name') or '').strip().split('\n')[0][:32]
+                path = f'{VAR}/doll{d["n"]}/name'
+                kept = (safe_read(path, 64) or '').strip().split('\n')[0]   # (its first line: a name, nothing else of a file)
+                if nm and s.get('identity', 'name') != 'unknown':
+                    if kept != nm:
+                        try:
+                            safe_write(path, nm + '\n', make=True)
+                        except OSError:                    # (not kept: its status tells it again)
+                            pass
+                else:
+                    nm = kept
+            if nm:
+                name_of[d['n']] = nm.upper()
+                by_name.setdefault(nm.upper(), []).append(d['n'])
+        same = sorted((k, tuple(v)) for k, v in by_name.items() if len(v) > 1)
+        if same != said_same:
+            for k, v in same:
+                say('dolls %s report the same name %s: one of them is not that player' % (', '.join(map(str, v)), k), 'W')
+            said_same = same
+        names = set(by_name)
+        text = ''.join(sorted(n + '\n' for n in names))
+        if text != names_written:
+            try:
+                safe_write(f'{VAR}/dolls.names', text, make=True)
+                names_written = text
+                write_failed(f'{VAR}/dolls.names')
+            except OSError as e:
+                write_failed(f'{VAR}/dolls.names', e, 'the dolls keep the names they have')
+        text = follow_levels(ds)                         # (before any start: a doll reads its line at its start)
+        if text != levels_written:
+            try:
+                safe_write(f'{VAR}/dolls.levels', text, make=True)
+                levels_written = text
+                write_failed(f'{VAR}/dolls.levels')
+            except OSError as e:
+                write_failed(f'{VAR}/dolls.levels', e, 'a doll at its bot\'s virtual dolls\' level starts with the last one written, or 5')
+        known = {d['n'] for d in ds}
+        # a doll service running without its settings file: stopped
+        for n in range(1, MAX_DOLLS + 1):
+            if n not in known and st.get(f'mgo1doll@{n}') in ('active', 'activating'):
+                if systemctl('stop', f'mgo1doll@{n}'):
+                    st[f'mgo1doll@{n}'] = 'inactive'
+                say('doll %d: stopped (no settings file)' % n)
+        steal.look(now)
+        for b in bots_on:                                  # (v150-host beta 16; a bot with no full doll too)
+            vpace.look(b, read_json(f'{VAR}/bot{b}/run/status.json') or {}, steal)
+        vdolls_on = sum(vdolls_set(read_json(f'{VAR}/bot{b}/run/status.json')) for b in bots_on)
+        budget = capacity(len(bots_on), vdolls_on)         # the dolls the server's cores and memory allow
+        if budget != said_budget:
+            say('the server can run %d dolls at once besides its %d bots%s' % (budget, len(bots_on),
+                ' and their %d virtual dolls' % vdolls_on if vdolls_on else ''))
+            said_budget = budget
+        total, sums_now = budget, {}
+        for bot in sorted({d['bot'] for d in ds}):
+            mine = [d for d in ds if d['bot'] == bot]
+            status = read_json(f'{VAR}/bot{bot}/run/status.json') or {}
+            there, unit = os.path.exists(f'{ETC}/bot{bot}.env'), st.get(f'mgo1host@{bot}', 'unknown')
+            hosting = there and status.get('state') == 'hosting' and unit == 'active'
+            players = [p for p in status.get('players', []) if not p.get('host')]
+            game = status.get('game', {})
+            try:
+                most = int(game.get('max') or game_settings(bot).get('max_players', 9))
+            except ValueError:
+                most = 9
+            seats = max(0, most - 1)                          # the dedicated host takes one
+            # (v150-host beta 16: a virtual doll's name is not a playable doll's, the owner's had the same ones)
+            in_game = {p.get('name', '').upper() for p in players if not p.get('vdoll')}
+            # (v141 beta 6) the host's own word when it gives it (its session table: each player's kind, an accountless doll's
+            # number from its user id): a doll in the game is found whatever its name; else the names, as before
+            kinds = bool(players) and all('kind' in p for p in players)
+            dolls_in = {p.get('doll') for p in players if p.get('doll')}
+            real = [p for p in players if p.get('kind') == 'real'] if kinds else [p for p in players if p.get('name', '').upper() not in names]
+            # the enabled dolls running (a disabled one is stopped below, for that reason)
+            on = [d for d in mine if d['enabled'] and running(f'mgo1doll@{d["n"]}')]
+            # a doll running and not in the game yet holds its seat; past DOLL_JOIN_TIMEOUT it starts again
+            # (a doll whose name is not known yet cannot be looked for: neither waiting nor started again)
+            waiting = []
+            for d in on:
+                n = d['n']
+                if (not d['account'] and n in dolls_in) or n not in name_of or name_of[n] in in_game:
+                    pending_since.pop(n, None)
+                    continue
+                t0 = pending_since.setdefault(n, now)
+                if pending_frame.get(n, {}).get('t0') != t0:          # (v141 beta 9) its game's frame when it was missed
+                    pending_frame[n] = {'t0': t0, 'at': doll_frame(n)[0], 'said': False}
+                waiting.append(n)
+                if hosting and n not in leaving and now - t0 > JOIN_WAIT and join_late(n, now, t0, pending_frame):
+                    # (v141 beta 6) what was looked for and what was there, before the restart (no account, no password)
+                    acct = {name_of[x['n']]: x['n'] for x in ds if x['account'] and x['n'] in name_of}
+                    say('doll %d: join timeout: %s' % (n, join_diag(d, name_of.get(n, ''), players, int(now - t0), acct)), 'W', f'doll{n}')
+                    systemctl('restart', f'mgo1doll@{n}')
+                    pending_since[n] = now
+                    say('doll %d: not in bot %d\'s game %d s after its start: started again' % (n, bot, int(now - t0)), 'W', f'doll{n}')
+            for n in [n for n in pending_since if n not in {d['n'] for d in on} and n in {d['n'] for d in mine}]:
+                pending_since.pop(n, None)
+            for n in [n for n in pending_frame if n not in pending_since]:
+                pending_frame.pop(n, None)
+            # (v141 beta 9) the pace guard: its dolls in the game and the bot itself, their "pace:" minutes
+            guarded = senv.get('DOLL_PACE_GUARD', '1') != '0'
+            if hosting and guarded:
+                ins = [d for d in on if d['n'] not in waiting and d['n'] not in leaving]
+                guard.look(bot, dict([(f'bot{bot}', f'{VAR}/bot{bot}/run/status.json')] +
+                                     [(f'doll{d["n"]}', f'{VAR}/doll{d["n"]}/status.json') for d in ins]), len(ins), len(real), now, steal.pct)
+                guard.lift(bot, len([d for d in mine if d['enabled']]))
+            # the dolls that may play now: the seats of its game less its real players, the seats of its virtual dolls (docs/
+            # VIRTUAL_DOLL.md: its status's vdolls_set, its game's own players), the seat kept; the server's budget; the pace
+            # guard's cap. (v150-host beta 16) Fewer than those set: why, said once a reason (doll_sums, say_why)
+            found = [d for d in mine if d['enabled'] and ((not d['account'] and d['n'] in dolls_in) or (d['n'] in name_of and name_of[d['n']] in in_game))]
+            # (v150-host beta 16) the seat kept: the game's own rule for its virtual dolls too (mgo1host.sh's MGO1_VDOLL_KEEP_SEAT:
+            # one kept unless DOLL_KEEP_SEAT=0 and DOLL_LIST=off, whatever DOLL_GATE), so that both sides count the same seats
+            keep_here = keep_seat or (listed and vdolls_set(status) > 0)
+            sums = doll_sums(bot, there, unit, str(status.get('state') or ''), most, len(real), vdolls_set(status), keep_here,
+                             len([d for d in mine if d['on']]), len([d for d in mine if d['on'] and not d['enabled']]), budget, total,
+                             guard.cap(bot) if guarded else None, guard.wait(bot, now) if guarded else 0, len(found))
+            want, vres = sums['want'], sums['vdolls']
+            budget -= want
+            say_why(bot, sums, said_why)
+            sums_now[str(bot)] = dict({'waiting_code': sums['code'], 'waiting_why': sums['why']}, **{k: sums[k] for k in SUMS_KEYS})
+            # too many: the ones not in the game yet stopped first, then the last ones leave (their leave order,
+            # then a stop if they have not gone in 30 s)
+            for d in sorted(on, key=lambda d: (d['n'] not in waiting, -d['n']))[:max(0, len(on) - want)]:
+                n, t = d['n'], leaving.get(d['n'])
+                if n in waiting and t is None:
+                    if systemctl('stop', f'mgo1doll@{n}'):
+                        st[f'mgo1doll@{n}'] = 'inactive'
+                    pending_since.pop(n, None)
+                    say('doll %d: stopped (not in bot %d\'s game yet and its seat needed: %d real players, %d seats%s)' % (
+                        n, bot, len(real), seats, ', one kept for a real player' if keep_here else ''))
+                elif t is None:
+                    order(n, 'leave')
+                    leaving[n] = now
+                    say('doll %d: told to leave bot %d\'s game (%d real players, %d seats%s)' % (
+                        n, bot, len(real), seats, ', one kept for a real player' if keep_here else ''))
+                elif now - t > LEAVE_WAIT:
+                    if systemctl('stop', f'mgo1doll@{n}'):
+                        st[f'mgo1doll@{n}'] = 'inactive'
+                    leaving.pop(n, None)
+                    say('doll %d: stopped (still there %d s after its leave order)' % (n, LEAVE_WAIT), 'W')
+            for d in mine:
+                if d['n'] in leaving and not running(f'mgo1doll@{d["n"]}'):
+                    leaving.pop(d['n'], None)
+            on = [d for d in mine if d['enabled'] and running(f'mgo1doll@{d["n"]}')]
+            # too few: the next enabled one starts (one start every START_GAP seconds for the whole server; a
+            # doll whose start failed waits 5 minutes, the next one is tried)
+            if len(on) < want and now - last_start >= START_GAP:
+                for d in mine:
+                    n = d['n']
+                    if d['enabled'] and d not in on and n not in leaving and now - start_failed.get(n, -1e9) > 300:
+                        last_start = now
+                        if systemctl('start', f'mgo1doll@{n}'):
+                            st[f'mgo1doll@{n}'] = 'activating'
+                            pending_since[n] = now
+                            start_failed.pop(n, None)
+                            say('doll %d: started for bot %d\'s game (%d real players, %d seats%s)' % (n, bot, len(real), seats,
+                                                                                ', %d for its virtual dolls' % vres if vres else ''))
+                        else:
+                            start_failed[n] = now
+                        break
+        # (v150-host beta 16) what was counted for each bot, for whoever looks (/var/lib/mgo1host/dolls.sums.json; mgo1host-agent
+        # counts the same for its `dolls`): written when it changes, the pace guard's wait once a minute
+        text = json.dumps({'budget': total, 'bots': {b: dict(v, pace_wait_s=0) for b, v in sums_now.items()}}, sort_keys=True)
+        if text != sums_written or now - sums_at >= 60:
+            try:
+                safe_write(f'{VAR}/dolls.sums.json', make=True, text=json.dumps({'t': int(now), 'budget': total, 'bots': sums_now}, sort_keys=True))
+            except OSError:
+                pass
+            sums_written, sums_at = text, now
+        # disabled dolls that still run (or with no account while DOLL_GATE=0): stopped
+        for d in ds:
+            if not d['enabled'] and running(f'mgo1doll@{d["n"]}') and st.get(f'mgo1doll@{d["n"]}') != 'unknown':
+                if systemctl('stop', f'mgo1doll@{d["n"]}'):
+                    st[f'mgo1doll@{d["n"]}'] = 'inactive'
+                say('doll %d: stopped (disabled%s)' % (d['n'], '' if d['account'] or accountless else ': no account, and DOLL_GATE=0'))
+        rounds += 1
+        if ROUNDS and rounds >= ROUNDS:
+            return
+        time.sleep(PERIOD)
+
+
+if __name__ == '__main__':
+    try:
+        if sys.argv[1:] == ['--counts']:
+            doll_counts(gate_on())
+            sys.exit(0)
+        main()
+    except KeyboardInterrupt:
+        sys.exit(0)
+    except Exception as e:                           # its service starts it again in 5 s
+        say('stopped by an error: %s: %s' % (type(e).__name__, e), 'E')
+        raise

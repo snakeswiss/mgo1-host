@@ -1,0 +1,102 @@
+# MGO1 Host for macOS (hostpanel/build_macos.sh) on a macOS 15 runner (Apple silicon): the universal package (arm64 and
+# x86_64) and an Intel-only one; each checked (file, lipo, the bundle's files, codesign) and its zip kept as an artifact.
+name: hostpanel-macos
+
+on:
+  push:
+    paths:
+      - "hostpanel/**"
+      - "MGO1Loader/spu2.*"
+      - "MGO1Loader/doll*.cpp"
+      - "host/install.sh"
+      - "host/mgo1host-agent"
+      - ".github/workflows/hostpanel-macos.yml"
+  pull_request:
+    paths:
+      - "hostpanel/**"
+      - "MGO1Loader/spu2.*"
+      - "MGO1Loader/doll*.cpp"
+      - "host/install.sh"
+      - "host/mgo1host-agent"
+      - ".github/workflows/hostpanel-macos.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: macOS ${{ matrix.name }}
+    runs-on: macos-15
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: universal
+            archs: "arm64 x86_64"
+          - name: x86_64
+            archs: "x86_64"
+    env:
+      ARCHS: ${{ matrix.archs }}
+      # (the dependencies outside the tree: hostpanel/deps may be a link of another machine's)
+      DEPS: ${{ github.workspace }}/.deps-macos
+      MACOSX_DEPLOYMENT_TARGET: "10.15"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Tools
+        run: |
+          xcode-select -p
+          command -v cmake >/dev/null || brew install cmake
+          clang --version | head -1
+          cmake --version | head -1
+          python3 --version
+          perl -e 'print "perl $^V\n"'
+          git --version
+
+      - name: Dependencies (cache)
+        uses: actions/cache@v4
+        with:
+          path: .deps-macos
+          key: hostpanel-macos-deps-${{ matrix.name }}-${{ hashFiles('hostpanel/build_macos.sh') }}
+
+      - name: Build
+        run: bash hostpanel/build_macos.sh
+
+      - name: Check the program, the bundle and the signature
+        run: |
+          set -euo pipefail
+          A="hostpanel/build-macos/MGO1 Host/MGO1 Host.app"
+          B="$A/Contents/MacOS/mgo1-host"
+          kind=$(file "$B")
+          echo "$kind"
+          lipo -info "$B"
+          for a in $ARCHS; do lipo "$B" -verify_arch "$a"; done
+          have=$(lipo -archs "$B")
+          [ "$(echo $have | wc -w)" -eq "$(echo $ARCHS | wc -w)" ] || { echo "architectures: $have, wanted: $ARCHS"; exit 1; }
+          if [ "${{ matrix.name }}" = universal ]; then grep -q "universal binary with 2 architectures" <<< "$kind"; fi
+          for f in Contents/MacOS/mgo1-host Contents/Resources/MGO1Host.icns Contents/Info.plist Contents/PkgInfo; do
+            [ -s "$A/$f" ] || { echo "missing: $f"; exit 1; }
+          done
+          plutil -lint "$A/Contents/Info.plist"
+          [ "$(cat "$A/Contents/PkgInfo")" = "APPL????" ]
+          codesign --verify --deep --strict --verbose=2 "$A"
+          sig=$(codesign -dv "$A" 2>&1)
+          echo "$sig"
+          grep -q "Signature=adhoc" <<< "$sig"
+          Z=hostpanel/build-macos/MGO1-Host-macos.zip
+          unzip -l "$Z"
+          for f in "MGO1 Host/MGO1 Host.app/Contents/MacOS/mgo1-host" "MGO1 Host/README.txt" "MGO1 Host/LISEZMOI.txt" \
+                   "MGO1 Host/licenses/OpenSSL-Apache2.txt" "MGO1 Host/licenses/DearImGui-MIT.txt"; do
+            unzip -l "$Z" "$f" >/dev/null || { echo "not in the zip: $f"; exit 1; }
+          done
+          # the zip as a user gets it: the signature still holds once unpacked
+          rm -rf unpacked && mkdir unpacked && ditto -x -k "$Z" unpacked
+          codesign --verify --deep --strict --verbose=2 "unpacked/MGO1 Host/MGO1 Host.app"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MGO1-Host-macos-${{ matrix.name }}
+          path: hostpanel/build-macos/MGO1-Host-macos.zip
+          if-no-files-found: error

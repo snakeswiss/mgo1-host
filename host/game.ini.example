@@ -1,0 +1,43 @@
+# The dedicated host's game (/etc/mgo1host.game; mgo1hostctl edit, then restart).
+# Written into the game's Create Game settings once the lobby has sent the account's last
+# settings: a key left out keeps the account's value. Host Only is always set.
+# Use the values the Create Game screens offer.
+
+# the game's name in the lobby's list (3 to 15 characters), its comment (up to 75),
+# a password lock (up to 15; empty: none)
+name = SaveMGO Host
+comment = Dedicated host, running 24/7
+password =
+
+# the rules and maps, played in this order: rule:map pairs (up to 15)
+#   rules: 0 deathmatch, 1 team deathmatch, 2 rescue, 3 capture, 4 sneaking,
+#          5 team sneaking, 6 base capture (games between PCs; rescue's and capture's times)
+#   maps:  1 Lost Forest, 2 Ghost Factory, 3 City Under Siege, 4 Killhouse A, 5 Killhouse B,
+#          6 Killhouse C, 7 Svyatogornyj East, 8 Mountaintop, 9 Graniny Gorki Lab,
+#          10 Pillbox Purgatory, 11 High Ice, 12 Brown Town,
+#          13 Silo Entrance, 14 REX Hangar, 15 Big Shell Strut E (the PC maps, /opt/mgo1host/maps)
+#   (every rule on every map; the tables, with the maps each rule is played on: RULES and MAPS
+#   in /opt/mgo1host/mgo1host-agent)
+rotation = 1:2, 0:8
+
+# teams: 0 GRU, 1 KGB, 2 Ocelot unit
+red_team = 0
+blue_team = 1
+# the players who can join + 1 (Host Only: the game's screens show 2 to 8 players, it sends 3 to 9; up to
+# 16, above 9 a game only PCs play; a game of 9 is told to the lobby as 8 so that every program joins it)
+max_players = 9
+# weapons: 0 all, 1 no primary, 2 no secondary, 3 no support, 4 primary only,
+# 5 secondary only, 6 support only, 7 knife only
+weapons = 0
+
+# minutes (and rounds, tickets) per rule, its key's prefix from RULES (1 to 99); also: tdm_tickets,
+# res_minutes, res_rounds, cap_minutes, cap_rounds, sne_minutes, sne_rounds
+dm_minutes = 5
+tdm_minutes = 5
+tdm_rounds = 2
+
+# switches: on / off; also: ghosts, unique_characters, team_auto_balance, team_kill_kick
+# (with team_kill_count), idle_kick_minutes
+friendly_fire = off
+idle_kick = on
+voice_chat = on

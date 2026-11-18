@@ -1,0 +1,59 @@
+#!/bin/bash
+# mgo1hostctl: the dedicated host's commands (as root, or over ssh: ssh root@server mgo1hostctl players)
+# The server runs bots 1 to 10; -b <bot> picks one (1 by default).
+#   mgo1hostctl bots                 the bots: account (masked), UDP port, state, players
+#   mgo1hostctl [-b N] players       the players in the bot's game (P1 the bot, P2.. and their names)
+#   mgo1hostctl [-b N] kick <P3|name>   kick a player (the game's own kick: the player leaves at once,
+#                                    the lobby is told)
+#   mgo1hostctl blacklist [add|remove <name>]   the server's blacklist: kicked as soon as they join any bot
+#   mgo1hostctl [-b N] whitelist [add|remove <name> | only on|off]   with only on: only these names may play
+#   mgo1hostctl [-b N] restart       end this game; the service creates a new one (about a minute)
+#   mgo1hostctl [-b N] settings      show the game's settings (/etc/mgo1host/bot<N>.game)
+#   mgo1hostctl [-b N] edit          edit them, then restart to create the game with them
+#   mgo1hostctl [-b N] stop | start  stop the bot (it stays stopped) / start it again
+#   mgo1hostctl [-b N] status        the service's state and its last lines
+#   mgo1hostctl [-b N] log           follow the log
+#   mgo1hostctl [-b N] report        the Game Report of today (the game's events, as JSON lines)
+# The answers of players / kick come from the log (a few seconds later).
+BOT=1
+if [ "${1:-}" = -b ]; then BOT=${2:-}; shift 2; fi
+case "$BOT" in [1-9]|10) ;; *) echo "mgo1hostctl: -b 1 to 10"; exit 2 ;; esac
+RUN=/var/lib/mgo1host/bot$BOT/run
+GAME=/etc/mgo1host/bot$BOT.game
+UNIT=mgo1host@$BOT
+running() { [ -d "$RUN" ] || { echo "bot $BOT is not running ($RUN missing)"; exit 1; }; }
+# what is shown never holds the bots' log-in data (IDs, passwords): logs are sent to others to troubleshoot
+masked() { mgo1host-agent redact; }
+answers() { journalctl -u "$UNIT" --since "-12s" --no-pager -o cat | grep -E "command (players|kick|quit|\")|kick P" | tail -"${1:-3}" | masked; }
+case "${1:-}" in
+    bots) mgo1host-agent bots | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+for b in d.get("bots", []):
+    acc = (b["account"][:1] + "***") if b["account"] else "(no account)"
+    print("bot %-2d %-15s UDP %d  %-8s %s" % (b["bot"], acc, b["port"], b["online"],
+          ("%s, %d player(s)" % (b["name"], b["players"])) if b["online"] == "online" else b["reason"]))' ;;
+    players) running; printf 'players\n' >> "$RUN/cmd.txt"; sleep 2; answers 1 ;;
+    kick) [ -n "${2:-}" ] || { echo "usage: mgo1hostctl [-b N] kick <P3|name>"; exit 2; }
+          running; mgo1host-agent --bot "$BOT" kick "$2" >/dev/null; sleep 3; answers 2 ;;
+    blacklist|whitelist)
+          case "${2:-}" in
+              "") mgo1host-agent --bot "$BOT" lists ;;
+              add|remove) [ -n "${3:-}" ] || { echo "usage: mgo1hostctl [-b N] $1 $2 <name>"; exit 2; }; mgo1host-agent --bot "$BOT" "$1-$2" "$3" ;;
+              only) mgo1host-agent --bot "$BOT" whitelist-only "${3:-}" ;;
+              *) echo "usage: mgo1hostctl [-b N] $1 [add|remove <name>]"; exit 2 ;;
+          esac ;;
+    restart) mgo1host-agent --bot "$BOT" restart >/dev/null && echo "bot $BOT: the game ends; a new one is created in about a minute (mgo1hostctl -b $BOT log)" ;;
+    settings) cat "$GAME" ;;
+    edit) "${EDITOR:-nano}" "$GAME"
+          read -r -p "Restart bot $BOT now, so that the game is created with these settings? [y/N] " a
+          case "$a" in y|Y|o|O) mgo1host-agent --bot "$BOT" restart >/dev/null; echo "restarting" ;; esac ;;
+    stop|start) mgo1host-agent --bot "$BOT" "$1" ;;
+    status) systemctl status "$UNIT" --no-pager -n 20 | masked ;;
+    log) journalctl -u "$UNIT" -f -o cat | masked ;;
+    report) mgo1host-agent --bot "$BOT" events --since "$(( $(date -u -d "$(date -u +%Y-%m-%d)" +%s) * 1000 ))" --limit 10000 | python3 -c '
+import json, sys
+for e in json.load(sys.stdin).get("events", []):
+    print(json.dumps(e, separators=(",", ":")))' ;;
+    *) sed -n '2,19p' "$0"; exit 2 ;;
+esac

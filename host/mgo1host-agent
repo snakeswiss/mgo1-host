@@ -1,0 +1,3209 @@
+#!/usr/bin/env python3
+"""mgo1host-agent: the dedicated host's control interface (MGO1 Host.exe calls it over SSH).
+The server runs bots 1 to 10 (systemd mgo1host@<bot>), each with its own SaveMGO account, game,
+UDP port (5730 to 5739), whitelist and Game Report; the blacklist is the server's, for every bot.
+--bot N (anywhere on the line) picks the bot, 1 by default.
+One JSON object on stdout per call (watch: one per line), {"ok": false, "error": ...} and exit 1
+on an error. Python 3 standard library only.
+
+  version | sysinfo | install-check [--hash]
+  bots | bot-add [port] | bot-remove <bot> | bot-port <port> | firewall
+  status | watch [seconds] [--since <ms>] | log [lines] [--essential] | events [--since <ms>] [--limit <n>]
+  redact                                           (stdin to stdout, the log-in data of the bots masked)
+  kick <P3|name>
+  lists | blacklist-add <name>... | blacklist-remove <name>... | whitelist-add <name>...
+  whitelist-remove <name>... | whitelist-only <on|off>        (ban, unban, bans: the blacklist)
+  restart | stop | start
+  settings-get | settings-set [--restart]          (settings: a JSON object on stdin; a max_players that leaves
+                                                    fewer seats than the bot's VDOLL_COUNT lowers it with it: the answer's
+                                                    "vdoll_count_lowered": n)
+               [--base <version>]                  (both answer "version" (bot<N>.game's: 16 hex
+                                                    digits of its SHA-256), "maps_here" (the disc's 12 maps and each PC map
+                                                    with a map.ini in the maps folder), "running", "applied" (the settings the
+                                                    running game started with: run/game.src), "applied_rotation" (the one it
+                                                    made), "pending" (the keys saved it does not play yet), "left_out" (the
+                                                    rotation's entries it does not play), "real_players", "settings_sync":
+                                                    true; settings-set "takes_effect": "now" (--restart), "next game", "next
+                                                    start". Refused, nothing written: a rotation entry on a map not here
+                                                    (rotation_map_missing), --base other than the file's version
+                                                    (settings_changed: changed since it was read))
+  host-list-9 <9|8>                                (developer compatibility only, as settings-get's "host_list_9": a Host
+                                                    Only game of 9, 8 players, told to the lobby as 9 or as 8, server.env
+                                                    HOST_LIST_9_AS_8; every bot at its next start)
+  account-get | account-set                        (account: {"id", "password"} on stdin)
+  schedule-get | schedule-set <HH:MM|off> | scheduled-restart
+  servers-get | servers-set [--restart]            (the servers of every bot: {"custom", "web", "gate", "gate_port",
+                                                    "stun", "stun_port"} on stdin; custom false: SaveMGO's)
+  logs [list] | logs get <bot<N>|doll<N>|manager> <YYYY-MM-DD> [--level E|EW] [--from <n>] [--lines <n>] [--find <text>]
+                                                   (the daily logs: /var/log/mgo1host/<source>/<day>.log, docs/LOGS.md)
+                                                   (a day of more than 100000 lines is shown less its
+                                                    floods' lines, summarised, then less its oldest lines, the first line
+                                                    saying how many; logs get ... --raw: the file as it is)
+  crashes [-b <bot> | --doll <n>] | crash [<source>/]<name> [--from <n>] [--lines <n>] [--tail <n>]
+                                                   (the crash reports, a game that ended badly:
+                                                    /var/log/mgo1host/<source>/crash/<UTC time>_<reason>.txt,
+                                                    docs/CRASH_REPORTS.md; crashes: time, reason, size, the header's
+                                                    fields, the newest first; crash: one report's lines)
+  dolls | doll-set <n> | doll-remove <n> | doll-keep-seat <on|off>   (the PLAYABLE DOLLs 1 to 64; doll-set: {"id",
+                                                    "password", "bot", "difficulty", "adapt_min", "adapt_max", "team",
+                                                    "enabled", "name"} on stdin; no account: an accountless doll,
+                                                    DOLL_<n>, unless DOLL_GATE=0; "name": an accountless doll's name in
+                                                    the game, "" its own DOLL_<n> again; a running doll leaves and comes
+                                                    back with it)
+  doll-count <bot> <n>                             (the bot's accountless dolls: its DOLL_COUNT, the dolls added or
+                                                    removed at once by mgo1doll-manager --counts; {"name"} on stdin:
+                                                    the name of the doll it adds)
+  doll-list <host|own|off>                         (how TX-55's game list shows the accountless dolls,
+                                                    server.env DOLL_LIST; each bot's game takes it at its next start)
+  host-unranked <auto|always|off>                  (SaveMGO's rankings and the dolls, server.env
+                                                    HOST_UNRANKED: auto, once a doll is in a game its players'
+                                                    statistics go with a VS rating of 0 (out of the rankings) to the
+                                                    game's end; always, every game's; off, none; each bot's game takes
+                                                    it at its next start; "dolls" tells it as "unranked")
+  vdolls | vdoll-set <bot> [--restart]            (the bot's virtual dolls, docs/VIRTUAL_DOLL.md: {"count": 0-15, "teams":
+                                                    "auto" or "red,blue,auto ..." (one a doll, the last for the rest),
+                                                    "level": 1-10 or "3,5,7" (the same way), "names": ["..."], "weapons":
+                                                    "auto" or "ak47,svd,auto ..." (ak47, xm16e1, scorpion, m37, svd)} on stdin;
+                                                    bot<N>.env VDOLL_COUNT, VDOLL_TEAMS, VDOLL_LEVEL and the names in
+                                                    bot<N>.vdolls; the bot's game takes them at its next start, --restart:
+                                                    now (a new game); one seat always left for a real player. vdolls: each
+                                                    bot's settings, those its running game was given ("applied") and
+                                                    "pending" when they differ)
+  vdoll-count <bot> <n>                            (the bot's virtual dolls wanted now, 0 to its
+                                                    players less 2: its game takes it within 2 s (more join as seats are
+                                                    free, the last ones leave), VDOLL_COUNT for its next games)
+  doll-order <n> difficulty <1-10|vdoll> | team <auto|red|blue|spectator> | order <free|objective|hide|defend>
+                 | order target <name> | order follow <name> | adapt <on|off> | adapt_min <1-10> | adapt_max <1-10>
+                 | aim <direct|pad> | leave           (doll-set also takes "loadout": auto | scorpion xm16 ak47 m37 svd
+                                                    mosin [,m1911|mk22], "adapt": the live level, true or false)
+  doll-all <bot> adapt <on|off> | difficulty <1-10|vdoll> | aim <direct|pad>  (every doll of a bot's game at once: MGO1 Host.exe's SBMM
+                                                    BOTS, the live level on or off, and their difficulty)
+  The difficulty: 1 TRAINING, 2 EASY, 3 NORMAL, 4 HARD, 5 EXPERT, 6 ELITE, 7 VETERAN, 8 MASTER, 9 EXTREME,
+  10 PRO; adapt_min, adapt_max: the live level's bounds (1 and 10 by default, swapped when the wrong way round)
+  The difficulty "vdoll" (doll-set's "difficulty", doll-order, doll-all; DOLL_DIFFICULTY=vdoll): the
+  level of the bot's virtual dolls (its VDOLL_LEVEL: the k-th of the bot's dolls set to play takes the k-th level, the
+  last for the rest), the live level off; `dolls` gives the number as "difficulty" and "difficulty_from": "vdoll" (else
+  "set") and, at its top, "vdoll_difficulty": true (an agent that takes that difficulty: MGO1 Host offers it on a
+  server with no doll yet only when it sees this); vdoll-set's "level" tells the running dolls that follow it at once
+  vdoll-set's "controls": "player" (the virtual dolls turn, aim and fire within what the pad lets a
+  player do; bot<N>.env VDOLL_CONTROLS=player, the game's MGO1_VDOLL_CONTROLS=player) or "direct" (the default, as before);
+  as the level, the bot's game takes it at its next start (--restart: now); vdolls gives "controls" for each bot (and in
+  "applied" for a game whose launcher recorded them) and, at its top, "vdoll_controls": true (MGO1 Host shows CONTROLS
+  only when it sees this). doll-set's "aim", doll-order <n> aim <direct|pad>, doll-all <bot> aim <direct|pad>: "direct"
+  (the playable doll turns its view at the speed of a virtual doll of its level, without the stick; doll<N>.env DOLL_AIM=direct, the game's
+  MGO1_DOLL_AIM=direct) or "pad" (the default, as before), live (the order `aim direct|pad`) and kept for its next starts;
+  dolls gives "aim" for each doll and, at its top, "doll_aim": true (MGO1 Host shows AIM only when it sees this)
+  The virtual dolls' live level: vdoll-set's "adapt" (true or false; bot<N>.env VDOLL_ADAPT=1|0, the
+  game's MGO1_VDOLL_ADAPT=1), "adapt_min", "adapt_max" (1 to 10, 1 and 10 by default, the bound not given kept, the lower
+  first; VDOLL_ADAPT_MIN, VDOLL_ADAPT_MAX): each virtual doll's level follows the strength of the game's real players,
+  from its level set (the anchor) between the two. Live: the running game reads them from run/vdolls.live's lines after
+  the count (`adapt 0|1`, `adapt_min <n>`, `adapt_max <n>`; an older game reads the count alone) and the
+  answer says "adapt_takes_effect": "now" (else "next game"); vdoll-count keeps those lines. vdolls gives "adapt",
+  "adapt_min", "adapt_max" for each bot (and in "applied" as its running game has them), "levels_now" (the level now of
+  each virtual doll in the game, its "live" entries in "in_game" state in their numbers' order, two decimals, from the
+  game's last `vdoll: levels now ...` line in the day's log since its start) and "levels_now_set" (their levels set, the
+  line's "(set ...)"); absent when the live level is off or the game has not said them) and, at its top,
+  "vdoll_adapt": true (MGO1 Host offers the
+  LIVE LEVEL only when it sees this). A PLAYABLE DOLL at the virtual dolls' level (difficulty "vdoll") follows the level
+  SET, never the level now
+  dolls' "bots": for each bot what mgo1doll-manager counts for its playable dolls: "waiting_code"
+  ("": they can start; bot_stopped, not_hosting, seats, server_full, pace_guard, gate_off), "waiting_why" (the manager's
+  log line), "seats", "real", "vdolls", "kept", "free_for_dolls", "dolls_set", "dolls_in", "pace_cap", "pace_wait_s",
+  "exists"; "budget": the dolls the server can run now; "manager": the doll manager's service
+"""
+import glob
+import hashlib
+import collections
+import errno
+import json
+import os
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import time
+
+AGENT_VERSION = "build 1.00"   # (build 1.00: what the answers say, MGO1 Host shows it as it is; an agent before it, 3.7 the last, is older)
+CONF = os.environ.get("MGO1_CONF_DIR", "/etc/mgo1host")
+HOME_DIR = os.environ.get("MGO1_HOME_DIR", "/opt/mgo1host")
+STATE_ROOT = os.environ.get("MGO1_STATE_DIR", "/var/lib/mgo1host")
+TIMER_DIR = os.environ.get("MGO1_SYSTEMD_DIR", "/etc/systemd/system")
+LOG_ROOT = os.environ.get("MGO1_LOG_DIR", "/var/log/mgo1host")    # the daily logs, a folder per bot, doll, the manager
+BANS_FILE = os.path.join(CONF, "blacklist")                  # the server's blacklist, for every bot
+SERVER_ENV = os.path.join(CONF, "server.env")
+SERVERS_FILE = os.path.join(CONF, "servers.ini")            # the servers of every bot, when not SaveMGO's
+# SaveMGO's servers (the game's menu script as SaveMGO's patch makes it); the script's slots hold
+# 42, 28 and 26 characters
+SAVEMGO = {"web": "http://savemgo.com/us/mgs3/", "gate": "107.161.80.126", "gate_port": 5731,
+           "stun": "15.204.66.207", "stun_port": 3478}
+SLOTS = {"web": 42, "gate": 28, "stun": 26}
+PORTS = range(5730, 5740)                                    # MGO1's [UDP Port No.]
+MAX_BOTS = 10
+KEEP_DAYS = 31                                               # the Game Report kept on the server
+NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+PLAYER_RE = re.compile(r"^[\x21-\x7e][\x20-\x7e]{0,15}$")     # a player's name as the game shows it
+# (v141 beta 5) an accountless doll's name in the game: 3 to 15 letters, digits, spaces (not first, last or two together)
+# and . _ - ! ? + *
+DOLL_NAME_RE = re.compile(r"^[A-Za-z0-9._!?+*-][A-Za-z0-9._!?+* -]{1,13}[A-Za-z0-9._!?+*-]$")
+DOLL_DEFAULT_RE = re.compile(r"^DOLL_\d+$", re.I)
+BOT = 1                                                      # --bot N
+
+# the game's rules and maps by the lobby's numbers (the rotation's rule:map pairs): the one table the
+# agent checks them with. A rule or a map more: a row here and the same in hostpanel/src/rules.cpp.
+#   a rule: its number, its settings' key prefix, its name, its settings (<prefix>_minutes, _rounds,
+#   _tickets: their limits), the maps it is played on (None: every map)
+RULES = (
+    {"id": 0, "prefix": "dm", "name": "deathmatch", "settings": {"minutes": (1, 99)}, "maps": None},
+    {"id": 1, "prefix": "tdm", "name": "team deathmatch", "settings": {"minutes": (1, 99), "rounds": (1, 99), "tickets": (1, 99)}, "maps": None},
+    {"id": 2, "prefix": "res", "name": "rescue", "settings": {"minutes": (1, 99), "rounds": (1, 99)}, "maps": None},
+    {"id": 3, "prefix": "cap", "name": "capture", "settings": {"minutes": (1, 99), "rounds": (1, 99)}, "maps": None},
+    {"id": 4, "prefix": "sne", "name": "sneaking", "settings": {"minutes": (1, 99), "rounds": (1, 99)}, "maps": None},
+    # (v141, games between PCs only) TEAM SNEAKING plays with rescue's minutes and rounds, BASE CAPTURE with capture's
+    {"id": 5, "prefix": "tsne", "name": "team sneaking", "settings": {}, "maps": None},
+    {"id": 6, "prefix": "bc", "name": "base capture", "settings": {}, "maps": None},
+)
+#   a map: its number, its stage page, its name, only the PC players have it
+MAPS = (
+    {"id": 1, "page": "n001a", "name": "Lost Forest", "pc_only": False},
+    {"id": 2, "page": "n002a", "name": "Ghost Factory", "pc_only": False},
+    {"id": 3, "page": "n003a", "name": "City Under Siege", "pc_only": False},
+    {"id": 4, "page": "n011a", "name": "Killhouse A", "pc_only": False},
+    {"id": 5, "page": "n012a", "name": "Killhouse B", "pc_only": False},
+    {"id": 6, "page": "n013a", "name": "Killhouse C", "pc_only": False},
+    {"id": 7, "page": "n021a", "name": "Svyatogornyj East", "pc_only": False},
+    {"id": 8, "page": "n022a", "name": "Mountaintop", "pc_only": False},
+    {"id": 9, "page": "n024a", "name": "Graniny Gorki Lab", "pc_only": False},
+    {"id": 10, "page": "n031a", "name": "Pillbox Purgatory", "pc_only": False},
+    {"id": 11, "page": "n032a", "name": "High Ice", "pc_only": False},
+    {"id": 12, "page": "n033a", "name": "Brown Town", "pc_only": False},
+    {"id": 13, "page": "n003a", "name": "Silo Entrance", "pc_only": True},      # (v141: the PC maps, docs/EXTRA_MAPS.md)
+    {"id": 14, "page": "n003a", "name": "REX Hangar", "pc_only": True},
+    {"id": 15, "page": "n022a", "name": "Big Shell Strut E", "pc_only": True},
+)
+
+
+def rule_maps(rule):
+    """The map numbers a rule is played on, in order."""
+    return [m["id"] for m in MAPS] if rule["maps"] is None else [m for m in rule["maps"] if any(x["id"] == m for x in MAPS)]
+
+
+def id_ranges(ids):
+    """[0, 1, 2, 3, 4, 7] -> "0-4, 7" (the rotation's error)."""
+    ids, out, i = sorted(ids), [], 0
+    while i < len(ids):
+        j = i
+        while j + 1 < len(ids) and ids[j + 1] == ids[j] + 1:
+            j += 1
+        out.append(str(ids[i]) if i == j else "%d-%d" % (ids[i], ids[j]))
+        i = j + 1
+    return ", ".join(out)
+
+
+ROTATION_PLAYS = {(r["id"], m) for r in RULES for m in rule_maps(r)}
+# a pair as the file holds it: the numbers' digits no wider than the table's
+ROTATION_PAIR = re.compile(r"(\d{1,%d}):(\d{1,%d})" % (max(len(str(r["id"])) for r in RULES), max(len(str(m["id"])) for m in MAPS)))
+ROTATION_TEXT = "rule %s : map %s" % (id_ranges(r["id"] for r in RULES), id_ranges(m["id"] for m in MAPS))
+
+# the settings file's keys: kind, limits (host/game.ini.example; the game's own ranges); the rules' own
+# keys from RULES, in its order
+SETTING_KEYS = dict(
+    [("name", ("text", 3, 15)), ("comment", ("text", 0, 75)), ("password", ("text", 0, 15)),
+     ("rotation", ("rotation", 1, 15)),
+     ("red_team", ("int", 0, 2)), ("blue_team", ("int", 0, 2)),
+     ("max_players", ("int", 3, 16)),    # Host Only: the players who join + 1 (v141: above 9, a game only PCs play)
+     ("weapons", ("int", 0, 7))] +
+    [("%s_%s" % (r["prefix"], k), ("int",) + tuple(lim)) for r in RULES for k, lim in r["settings"].items()] +
+    [("auto_balance", ("int", 2, 6)), ("idle_kick_minutes", ("int", 1, 99)),
+     ("team_kill_count", ("int", 1, 99)), ("rating_restriction", ("int", 0, 2)), ("rating", ("int", 100, 9900)),
+     ("unique_characters", ("switch",)), ("rumble_roses", ("switch",)), ("ghosts", ("switch",)),
+     ("friendly_fire", ("switch",)), ("team_auto_balance", ("switch",)), ("idle_kick", ("switch",)),
+     ("team_kill_kick", ("switch",)), ("voice_chat", ("switch",))])
+
+
+class Fail(Exception):
+    """An error: its English text, and a code with its arguments (MGO1 Host.exe shows it in its language)."""
+    def __init__(self, text, code="", *args):
+        super().__init__(text)
+        self.code = code
+        self.args_ = [str(a) for a in args]
+
+
+def out(obj):
+    sys.stdout.write(json.dumps(obj, separators=(",", ":")) + "\n")
+    sys.stdout.flush()
+
+
+def tool(name):
+    return os.environ.get("MGO1_" + name.upper(), shutil.which(name) or name)
+
+
+def sh(args, timeout=30):
+    try:
+        p = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+        return p.returncode, p.stdout, p.stderr
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return 127, "", str(e)
+
+
+def systemctl(*args, timeout=30):
+    return sh([tool("systemctl")] + list(args), timeout)
+
+
+OWNED_ROOTS = (STATE_ROOT, LOG_ROOT)                          # the folders the games' user owns (dir_fd, safe_write, safe_read)
+
+# ---- (v150-host beta 16) root's files in the folders the game's user owns ------------------------------------------
+# /var/lib/mgo1host (the bots' run folders, the dolls' folders) and /var/log/mgo1host belong to the user the games run as,
+# and a game reads the internet's datagrams: whoever got to run code as that user must not get root's hands through a
+# symbolic link left where root writes (a doll's `command`, a bot's `cmd.txt`, a .tmp file, a folder itself). Every
+# such file is opened here: each folder below those roots in turn with O_NOFOLLOW, the file itself with O_NOFOLLOW, a
+# plain file with one name only; a new file under a name of its writer's own, then renamed (a rename replaces a link, never
+# what it points to). Reading: the same way, and never waiting on a pipe left there.
+def dir_fd(d, make=False):
+    """A descriptor of folder d; below the game's user's roots, reached through no symbolic link (make: made when missing,
+    the game's user's)."""
+    d = os.path.abspath(d)
+    for root in OWNED_ROOTS:
+        root = os.path.abspath(root)
+        if d != root and not d.startswith(root + os.sep):
+            continue
+        if make and not os.path.isdir(root):
+            os.makedirs(root, exist_ok=True)
+        fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            for part in [p for p in os.path.relpath(d, root).split(os.sep) if p not in ("", ".")]:
+                try:
+                    nfd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+                except FileNotFoundError:
+                    if not make:
+                        raise
+                    os.mkdir(part, 0o755, dir_fd=fd)
+                    nfd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+                    game_owner(nfd)
+                os.close(fd)
+                fd = nfd
+            return fd
+        except BaseException:
+            os.close(fd)
+            raise
+    return os.open(d, os.O_RDONLY | os.O_DIRECTORY)
+
+
+def game_owner(fd):
+    """An open file or folder given to the games' user (mgo1host), when there is one."""
+    try:
+        import grp, pwd
+        os.fchown(fd, pwd.getpwnam("mgo1host").pw_uid, grp.getgrnam("mgo1host").gr_gid)
+    except (KeyError, OSError):
+        pass
+
+
+def safe_write(path, text, mode=0o644, append=False, owner=False, make=False):
+    """A file written by root: whole (a file of this writer's own, then renamed) or one more line (append). Never through
+    a link, never another file's second name; owner: given to the games' user. OSError when it cannot."""
+    d, name = os.path.split(os.path.abspath(path))
+    dfd = dir_fd(d, make)
+    try:
+        tmp = name if append else "%s.%d.tmp" % (name, os.getpid())
+        if not append:
+            try:
+                os.unlink(tmp, dir_fd=dfd)
+            except OSError:
+                pass
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | (os.O_APPEND if append else os.O_EXCL), mode, dir_fd=dfd)
+        try:
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1:
+                raise OSError(errno.EPERM, "not a plain file of its own", path)
+            data = text.encode("utf-8", "replace")
+            while data:
+                data = data[os.write(fd, data):]
+            if not append:
+                os.fchmod(fd, mode)
+                # (v150-host beta 22, sync) on the disk before it takes the old file's name: a power cut or a crash of the
+                # server right after the rename leaves the old file or the new one whole, never an empty one
+                os.fsync(fd)
+            if owner:
+                game_owner(fd)
+        except BaseException:
+            if not append:
+                try:
+                    os.unlink(tmp, dir_fd=dfd)
+                except OSError:
+                    pass
+            raise
+        finally:
+            os.close(fd)
+        if not append:
+            os.replace(tmp, name, src_dir_fd=dfd, dst_dir_fd=dfd)
+            try:
+                os.fsync(dfd)                                  # (beta 22, sync: the new name itself on the disk)
+            except OSError:
+                pass
+    finally:
+        os.close(dfd)
+
+
+def safe_read(path, limit=4 << 20):
+    """A file's text as root reads it from the game's user's folders: a plain file reached through no link, limit bytes at
+    most; None when there is none (or a link, a pipe, a folder)."""
+    try:
+        d, name = os.path.split(os.path.abspath(path))
+        dfd = dir_fd(d)
+        try:
+            fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dfd)
+        finally:
+            os.close(dfd)
+        with os.fdopen(fd, "rb") as f:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                return None
+            return f.read(limit).decode("utf-8", "replace")
+    except OSError:
+        return None
+
+
+def write_atomic(path, text, mode=0o644):
+    """A settings or state file written whole: a file of this call's own (two calls at once never share one), then renamed;
+    in the game's user's folders never through a link (safe_write)."""
+    safe_write(path, text, mode)
+
+
+def unquote(v):
+    """(v141 beta 6) A value as systemd's EnvironmentFile gives it to the services: its quotes around it dropped."""
+    v = v.strip()
+    if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'":
+        v = v[1:-1]
+    return v
+
+
+def read_kv(path):
+    kv = {}
+    try:
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                kv[k.strip()] = unquote(v)
+    except OSError:
+        pass
+    return kv
+
+
+def chown_bot(path):
+    """A folder given to the games' user (never what a link left in its place points to)."""
+    try:
+        import grp, pwd
+        os.chown(path, pwd.getpwnam("mgo1host").pw_uid, grp.getgrnam("mgo1host").gr_gid, follow_symlinks=False)
+    except (KeyError, LookupError, OSError):
+        pass
+
+
+# ---- the bots --------------------------------------------------------------------------------------
+def bot_env(n=None):
+    return os.path.join(CONF, "bot%d.env" % (n or BOT))
+
+
+def bot_game(n=None):
+    return os.path.join(CONF, "bot%d.game" % (n or BOT))
+
+
+def bot_white(n=None):
+    return os.path.join(CONF, "bot%d.whitelist" % (n or BOT))
+
+
+def bot_state(n=None):
+    return os.path.join(STATE_ROOT, "bot%d" % (n or BOT))
+
+
+def service(n=None):
+    return "mgo1host@%d" % (n or BOT)
+
+
+def bots():
+    """The bots this server has: their numbers, in order."""
+    res = []
+    for p in glob.glob(os.path.join(CONF, "bot*.env")):
+        m = re.fullmatch(r"bot(\d+)\.env", os.path.basename(p))
+        if m and 1 <= int(m.group(1)) <= MAX_BOTS:
+            res.append(int(m.group(1)))
+    return sorted(res)
+
+
+def need_bot():
+    if not os.path.isfile(bot_env()):
+        raise Fail("no bot %d on this server (bots: %s)" % (BOT, ", ".join(map(str, bots())) or "none"), "no_bot", BOT, ", ".join(map(str, bots())) or "-")
+
+
+def port_of(n=None):
+    try:
+        return int(read_kv(bot_env(n)).get("UDP_PORT", "") or 5729 + (n or BOT))
+    except ValueError:
+        return 5729 + (n or BOT)
+
+
+# ---- no log-in data in what is shown or logged -------------------------------------------------
+def secrets(n=None):
+    """The log-in data to mask: [(text in capitals, whole word only)] for bot n, or every bot."""
+    res = []
+    for b in ([n] if n else bots()):
+        kv = read_kv(bot_env(b))
+        for k, word in (("HOST_ACCOUNT_ID", True), ("HOST_ACCOUNT_PASSWORD", False)):
+            v = kv.get(k, "").strip().upper()
+            if len(v) >= 3:
+                res.append((v, word))
+        gpw = read_kv(bot_game(b)).get("password", "").strip().upper()
+        if gpw:
+            res.append((gpw, True))                        # the game's password lock
+    if not n:                                              # the PLAYABLE DOLLs' accounts too
+        for d in dolls():
+            kv = read_kv(doll_env(d))
+            for k, word in (("DOLL_ACCOUNT_ID", True), ("DOLL_ACCOUNT_PASSWORD", False)):
+                v = kv.get(k, "").strip().upper()
+                if len(v) >= 3:
+                    res.append((v, word))
+    return sorted(set(res), key=lambda x: -len(x[0]))
+
+
+def redact(text, sec):
+    """text with each secret masked (***); an account ID or a game password as a whole word only."""
+    if not text or not sec:
+        return text
+    up = text.upper()
+    for v, word in sec:
+        if v not in up:
+            continue
+        out, i = [], 0
+        while True:
+            j = up.find(v, i)
+            if j < 0:
+                break
+            before = up[j - 1] if j else ""
+            after = up[j + len(v)] if j + len(v) < len(up) else ""
+            if word and (re.match(r"[A-Z0-9_]", before) or re.match(r"[A-Z0-9_]", after)):
+                out.append(text[i:j + len(v)])
+            else:
+                out.append(text[i:j] + "***")
+            i = j + len(v)
+        out.append(text[i:])
+        text = "".join(out)
+        up = text.upper()
+    return text
+
+
+def redact_event(e, sec):
+    """An event of the Game Report with no log-in data: the old owner's lines lose theirs too."""
+    if e.get("k") == "admin" and e.get("do") == "account":
+        e.pop("a", None)
+    if e.get("k") == "admin" and e.get("do") == "servers":
+        e.pop("gate", None)
+        e.pop("stun", None)
+    for k, v in list(e.items()):
+        if isinstance(v, str):
+            e[k] = redact(v, sec)
+        elif isinstance(v, list):
+            e[k] = [redact_event(x, sec) if isinstance(x, dict) else redact(x, sec) if isinstance(x, str) else x for x in v]
+    return e
+
+
+def cmd_redact():
+    """A filter: every line of stdin to stdout with the log-in data of every bot masked."""
+    sec = secrets()
+    for line in sys.stdin:
+        sys.stdout.write(redact(line, sec))
+        sys.stdout.flush()
+    return None
+
+
+# ---- the Game Report ------------------------------------------------------------------------------
+def events_dir(n=None):
+    return os.path.join(bot_state(n), "events")
+
+
+def note(kind, **fields):
+    """An event of this program's own (the owner's actions), in <day>.admin.jsonl beside the game's."""
+    d = events_dir()
+    try:
+        t = int(time.time() * 1000)
+        line = json.dumps(dict({"t": t, "k": kind}, **fields), separators=(",", ":"))
+        safe_write(os.path.join(d, time.strftime("%Y-%m-%d", time.gmtime(t / 1000)) + ".admin.jsonl"), line + "\n", append=True, make=True)
+    except OSError:
+        pass
+
+
+def events_prune(n=None):
+    """The days older than KEEP_DAYS go."""
+    limit = time.strftime("%Y-%m-%d", time.gmtime(time.time() - KEEP_DAYS * 86400))
+    for p in glob.glob(os.path.join(events_dir(n), "*.jsonl")):
+        if os.path.basename(p)[:10] < limit:
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+
+
+EVENT_T = re.compile(r'\{"t":(\d+)')
+
+
+def events_read(since, limit):
+    """The events with t >= since, oldest first, at most limit (and whether more remain). (v141 beta 4) a day at a time
+    (its game lines and the owner's merged), the reading stopped once past the limit; a line older than since skipped
+    from its "t" without decoding it."""
+    day = time.strftime("%Y-%m-%d", time.gmtime(max(since, 0) / 1000))
+    by_day = {}
+    for p in glob.glob(os.path.join(events_dir(), "*.jsonl")):
+        if os.path.basename(p)[:10] >= day:
+            by_day.setdefault(os.path.basename(p)[:10], []).append(p)
+    evs, more = [], False
+    for d in sorted(by_day):
+        day_evs = []
+        for p in sorted(by_day[d]):
+            try:
+                with open(p, errors="replace") as f:
+                    for line in f:
+                        m = EVENT_T.match(line)
+                        if m and int(m.group(1)) < since:
+                            continue
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            e = json.loads(line)
+                        except ValueError:
+                            continue
+                        if isinstance(e, dict) and isinstance(e.get("t"), int) and e["t"] >= since:
+                            day_evs.append(e)
+            except OSError:
+                continue
+        day_evs.sort(key=lambda e: e["t"])                 # the game's lines and the owner's, merged
+        evs.extend(day_evs)
+        if len(evs) > limit:
+            more = True
+            break
+    sec = secrets(BOT)
+    return [redact_event(e, sec) for e in evs[:limit]], more
+
+
+class EventTail:
+    """The Game Report's new lines as they are written: each file of the bot's events read on from
+    where it was last read (the host's day file and the owner's, the next days as they come)."""
+
+    def __init__(self):
+        self.pos = {}
+        for p in glob.glob(os.path.join(events_dir(), "*.jsonl")):
+            try:
+                self.pos[p] = os.path.getsize(p)
+            except OSError:
+                pass
+
+    def read(self):
+        evs = []
+        today = time.strftime("%Y-%m-%d", time.gmtime(time.time() - 3600))
+        for p in sorted(glob.glob(os.path.join(events_dir(), "*.jsonl"))):
+            if os.path.basename(p)[:10] < today and p in self.pos:
+                continue                                   # a past day: nothing is written there any more
+            try:
+                with open(p, "rb") as f:
+                    f.seek(self.pos.get(p, 0))
+                    data = f.read()
+            except OSError:
+                continue
+            end = data.rfind(b"\n") + 1                   # whole lines only
+            self.pos[p] = self.pos.get(p, 0) + end
+            for line in data[:end].decode(errors="replace").splitlines():
+                try:
+                    e = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(e, dict) and isinstance(e.get("t"), int):
+                    evs.append(e)
+        evs.sort(key=lambda e: e["t"])
+        sec = secrets(BOT) if evs else []
+        return [redact_event(e, sec) for e in evs]
+
+
+def cmd_events(args):
+    need_bot()
+    since, limit = 0, 2000
+    if "--since" in args:
+        since = int(args[args.index("--since") + 1])
+    if "--limit" in args:
+        limit = max(1, min(int(args[args.index("--limit") + 1]), 10000))
+    events_prune()
+    evs, more = events_read(since, limit)
+    return {"ok": True, "bot": BOT, "events": evs, "more": more, "now": int(time.time() * 1000)}
+
+
+# ---- the host's state -----------------------------------------------------------------------------
+_STATE_CACHE = {}                                  # ("a" | "e", unit) -> (time, answer)
+
+
+def service_state(n=None):
+    """(v141 beta 4) systemctl's answers kept 3 s: the watch asked both every second and every bot's every 2 s, each a
+    process and a call to systemd."""
+    unit, now = service(n), time.time()
+    a = _STATE_CACHE.get(("a", unit))
+    if not a or now - a[0] > 3:
+        rc, so, _ = systemctl("is-active", unit)
+        a = (now, so.strip() or ("unknown" if rc == 127 else "inactive"))
+        _STATE_CACHE[("a", unit)] = a
+    e = _STATE_CACHE.get(("e", unit))
+    if not e or now - e[0] > 3:
+        rc, so, _ = systemctl("is-enabled", unit)
+        e = (now, so.strip() == "enabled")
+        _STATE_CACHE[("e", unit)] = e
+    return a[1], e[1]
+
+
+def host_process(n=None):
+    """The bot's game process (Wine runs mgo1host.exe in the bot's run folder): pid, CPU ticks, memory, start."""
+    run = os.path.join(bot_state(n), "run")
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit() or int(pid) == os.getpid():
+            continue
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as f:
+                cmd = f.read()
+            if b"mgo1host.exe" not in cmd or b"mgo1host-agent" in cmd or b"wine" in cmd.split(b"\0")[0]:
+                continue
+            if os.readlink(f"/proc/{pid}/cwd") != run:
+                continue
+            with open(f"/proc/{pid}/stat") as f:
+                st = f.read().rsplit(")", 1)[1].split()
+            return {"pid": int(pid), "ticks": int(st[11]) + int(st[12]), "rss": int(st[21]) * os.sysconf("SC_PAGE_SIZE"),
+                    "start": int(st[19])}
+        except (OSError, IndexError, ValueError):
+            continue
+    return None
+
+
+def uptime_s():
+    try:
+        with open("/proc/uptime") as f:
+            return float(f.read().split()[0])
+    except OSError:
+        return 0.0
+
+
+def sys_now():
+    info = {}
+    try:
+        info["load"] = [round(x, 2) for x in os.getloadavg()]
+    except OSError:
+        info["load"] = []
+    mem = {}
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                k, v = line.split(":", 1)
+                mem[k] = int(v.split()[0]) // 1024
+    except OSError:
+        pass
+    info["mem_total_mb"] = mem.get("MemTotal", 0)
+    info["mem_avail_mb"] = mem.get("MemAvailable", 0)
+    du = shutil.disk_usage(STATE_ROOT if os.path.isdir(STATE_ROOT) else "/")
+    info["disk_free_gb"] = round(du.free / 2**30, 1)
+    info["uptime_s"] = int(uptime_s())
+    info["cores"] = os.cpu_count() or 1
+    # (v141 beta 12) about 0.35 of a core (a quarter of the cores kept free, the VPS's steal taken off) and 350 MB a bot
+    info["bots_max"] = max(1, min(MAX_BOTS, int(usable_cores() / 0.35), int((info["mem_total_mb"] - 400) / 350)))
+    return info
+
+
+def read_status(n=None):
+    path = os.path.join(bot_state(n), "run", "status.json")
+    try:
+        st = os.stat(path)
+        with open(path) as f:
+            return json.load(f), time.time() - st.st_mtime
+    except (OSError, ValueError):
+        return None, None
+
+
+def schedule_now():
+    path = os.path.join(TIMER_DIR, "mgo1host-restart.timer")
+    try:
+        with open(path) as f:
+            m = re.search(r"OnCalendar=\*-\*-\* (\d\d):(\d\d)", f.read())
+    except OSError:
+        return "off"
+    if not m:
+        return "off"
+    rc, so, _ = systemctl("is-enabled", "mgo1host-restart.timer")
+    return f"{m.group(1)}:{m.group(2)}" if so.strip() == "enabled" else "off"
+
+
+def online_of(svc, host, age, proc):
+    """online / starting / offline, and why."""
+    proc_up = uptime_s() - proc["start"] / os.sysconf("SC_CLK_TCK") if proc else None
+    if svc not in ("active", "activating", "reloading"):
+        return "offline", "service " + svc
+    if host is None or age is None or proc is None or age > proc_up + 1:
+        return "starting", "no status yet"                   # no game process, or its status is the last one's
+    if age > 15:
+        return "offline", "status not updated for %d s" % age
+    if host.get("state") == "hosting" and host.get("lobby") == 1:
+        return "online", ""
+    if host.get("state") == "hosting":
+        return "offline", "lobby connection closed"
+    if host.get("state") == "lost":
+        return "offline", "game ended (a new one is being created)"
+    if host.get("error"):
+        return "offline", "log-in error: " + str(host["error"])[:120]    # the game's own message on the screen
+    return "starting", "logging in / creating the game"
+
+
+def lobby_grace(n=None):
+    """(v141 beta 6) The seconds a bot's game waits for a new lobby connection before it ends with 6: HOST_LOBBY_GRACE
+    (server.env, its bot<N>.env over it, as systemd reads them), 10 by default, 5 to 60 as the game takes it."""
+    kv = read_kv(SERVER_ENV)
+    kv.update(read_kv(bot_env(n)))
+    m = re.match(r"\s*([+-]?\d+)", kv.get("HOST_LOBBY_GRACE", "") or "10")
+    return max(5, min(60, int(m.group(1)) if m else 0))
+
+
+def lobby_restart_in(svc, host, age, proc):
+    """(v141 beta 6) The seconds left before the game ends with 6 (its lobby connection closed): the grace less the host's
+    lobby_lost_for; None when the lobby is not lost or the status is not the running game's."""
+    lost = (host or {}).get("lobby_lost_for")
+    if not isinstance(lost, (int, float)) or isinstance(lost, bool) or lost < 0:
+        return None
+    if svc not in ("active", "activating", "reloading") or age is None or proc is None or age > 15 \
+            or age > uptime_s() - proc["start"] / os.sysconf("SC_CLK_TCK") + 1:
+        return None
+    return max(0, lobby_grace() - int(lost))
+
+
+def player_kinds(players):
+    """(v141 beta 6) (real players, dolls) among a game's players (the host left out): each player's "kind" when the host
+    gives it, else the server's dolls' names (the doll manager's dolls.names, as the manager does)."""
+    if not players:
+        return 0, 0
+    if all("kind" in p for p in players):
+        return len([p for p in players if p.get("kind") == "real"]), len([p for p in players if p.get("kind") == "doll"])
+    try:
+        with open(os.path.join(STATE_ROOT, "dolls.names"), encoding="utf-8", errors="replace") as f:
+            names = {line.strip().upper() for line in f if line.strip()}
+    except OSError:
+        names = set()
+    k = len([p for p in players if str(p.get("name", "")).upper() in names])
+    return len(players) - k, k
+
+
+def bot_summary(n):
+    svc, enabled = service_state(n)
+    host, age = read_status(n)
+    proc = host_process(n)
+    online, reason = online_of(svc, host, age, proc)
+    live = online == "online"
+    game = (host or {}).get("game", {}) if live else {}
+    players = [p for p in (host or {}).get("players", []) if not p.get("host")] if live else []
+    real, in_dolls = player_kinds(players)
+    # (v141 beta 7) the game now unranked (1: its statistics with a VS rating of 0, a doll was in it or HOST_UNRANKED always), 0
+    # ranked, None not known (an older game, or not online)
+    unranked = (host or {}).get("unranked") if live else None
+    return {"bot": n, "account": read_kv(bot_env(n)).get("HOST_ACCOUNT_ID", ""), "port": port_of(n), "service": svc,
+            "enabled": enabled, "online": online, "reason": reason, "name": game.get("name", ""),
+            "players": len(players), "real": real, "dolls": in_dolls, "max": game.get("max", 0), "unranked": unranked}
+
+
+def cmd_bots():
+    return {"ok": True, "bots": [bot_summary(n) for n in bots()], "max": MAX_BOTS, "sys": sys_now()}
+
+
+def status(prev=None, slow=None):
+    """The bot's whole state; prev: the last call's process sample (watch computes CPU from it)."""
+    svc, enabled = service_state()
+    host, age = read_status()
+    proc = host_process()
+    now = time.monotonic()
+    cpu = None
+    if proc and prev and prev.get("pid") == proc["pid"]:
+        dt = now - prev["t"]
+        if dt > 0:
+            cpu = round(100.0 * (proc["ticks"] - prev["ticks"]) / os.sysconf("SC_CLK_TCK") / dt, 1)
+    sample = dict(proc, t=now) if proc else None
+    online, reason = online_of(svc, host, age, proc)
+    kv = read_kv(bot_env())
+    res = {"ok": True, "agent": AGENT_VERSION, "bot": BOT, "time": int(time.time()),
+           "installed": os.path.isfile(os.path.join(HOME_DIR, "mgo1host.exe")),
+           "service": svc, "enabled": enabled, "online": online, "reason": reason, "status_age": None if age is None else round(age, 1),
+           "lobby_restart_in": lobby_restart_in(svc, host, age, proc),
+           "host": host, "account": kv.get("HOST_ACCOUNT_ID", ""), "port": port_of(), "lists": lists_json(*lists_read()),
+           "proc": {"cpu": cpu, "rss_mb": proc["rss"] // 2**20 if proc else None,
+                    "uptime_s": int(uptime_s() - proc["start"] / os.sysconf("SC_CLK_TCK")) if proc else None}}
+    res.update(slow if slow is not None else {"sys": sys_now(), "schedule": schedule_now(), "bots": [bot_summary(n) for n in bots()]})
+    return res, sample
+
+
+# ---- the firewall -----------------------------------------------------------------------------------
+def firewall_kind():
+    rc, so, _ = sh([tool("ufw"), "status"], 15) if shutil.which("ufw") or os.environ.get("MGO1_UFW") else (1, "", "")
+    if rc == 0 and "Status: active" in so:
+        return "ufw"
+    if shutil.which("firewall-cmd") or os.environ.get("MGO1_FIREWALL-CMD"):
+        rc, so, _ = sh([tool("firewall-cmd"), "--state"], 15)
+        if rc == 0 and "running" in so:
+            return "firewalld"
+    return "none"
+
+
+def firewall(port, open_it=True):
+    """The server's own firewall for a bot's UDP port: (kind, done)."""
+    kind = firewall_kind()
+    if kind == "ufw":
+        rc, _, _ = sh([tool("ufw")] + (["allow"] if open_it else ["delete", "allow"]) + ["%d/udp" % port], 30)
+        return kind, rc == 0
+    if kind == "firewalld":
+        rc, _, _ = sh([tool("firewall-cmd"), "-q", "--permanent", ("--add-port=%d/udp" if open_it else "--remove-port=%d/udp") % port], 30)
+        if rc == 0:
+            rc, _, _ = sh([tool("firewall-cmd"), "-q", "--reload"], 30)
+        return kind, rc == 0
+    return kind, True
+
+
+def cmd_firewall():
+    return {"ok": True, "firewall": firewall_kind(), "ports": [port_of(n) for n in bots()]}
+
+
+# ---- bots: add, remove, their port ------------------------------------------------------------------
+def cmd_bot_add(args):
+    have = bots()
+    if len(have) >= MAX_BOTS:
+        raise Fail("this server already has %d bots" % MAX_BOTS, "bots_full", MAX_BOTS)
+    n = next(i for i in range(1, MAX_BOTS + 1) if i not in have)
+    used = {port_of(b) for b in have}
+    if args:
+        if not args[0].isdigit() or int(args[0]) not in PORTS:
+            raise Fail("port: 5730 to 5739", "port_range")
+        port = int(args[0])
+        if port in used:
+            raise Fail("UDP port %d is already bot %d's" % (port, next(b for b in have if port_of(b) == port)), "port_used", port, next(b for b in have if port_of(b) == port))
+    else:
+        free = [p for p in PORTS if p not in used]
+        if not free:
+            raise Fail("no free UDP port (5730 to 5739)", "no_port")
+        port = 5729 + n if 5729 + n in free else free[0]
+    try:
+        with open(os.path.join(HOME_DIR, "bot.env.example")) as f:
+            text = f.read()
+    except OSError:
+        text = "HOST_ACCOUNT_ID=\nHOST_ACCOUNT_PASSWORD=\nUDP_PORT=5730\n"
+    text = re.sub(r"(?m)^UDP_PORT=.*$", "UDP_PORT=%d" % port, text)
+    write_atomic(bot_env(n), text, 0o600)
+    if not os.path.isfile(bot_game(n)):
+        src = os.path.join(HOME_DIR, "game.ini.example")
+        shutil.copyfile(src, bot_game(n)) if os.path.isfile(src) else write_atomic(bot_game(n), "")
+        os.chmod(bot_game(n), 0o644)
+    if not os.path.isfile(bot_white(n)):
+        write_atomic(bot_white(n), "# MGO1 dedicated host: the whitelist of bot %d\n# only = on: only these names may play "
+                     "(the others are kicked as soon as they join)\nonly = off\n" % n)
+    for d in (bot_state(n), os.path.join(bot_state(n), "events")):
+        os.makedirs(d, exist_ok=True)
+        chown_bot(d)
+    kind, done = firewall(port, True)
+    global BOT
+    BOT = n
+    note("admin", do="bot-add", port=port)
+    return {"ok": True, "bot": n, "port": port, "firewall": kind, "firewall_done": done}
+
+
+def cmd_bot_remove(args):
+    if not args or not args[0].isdigit() or int(args[0]) not in bots():
+        raise Fail("bot-remove <bot>", "usage", "bot-remove <bot>")
+    n = int(args[0])
+    port = port_of(n)
+    systemctl("disable", "--now", service(n), timeout=60)
+    for p in (bot_env(n), bot_game(n), bot_white(n), os.path.join(CONF, "bot%d.vdolls" % n)):
+        try:
+            os.remove(p)
+        except OSError:
+            pass
+    shutil.rmtree(bot_state(n), ignore_errors=True)
+    kind, done = firewall(port, False)
+    return {"ok": True, "bot": n, "port": port, "firewall": kind, "firewall_done": done}
+
+
+def cmd_bot_port(args):
+    need_bot()
+    if not args or not args[0].isdigit() or int(args[0]) not in PORTS:
+        raise Fail("bot-port <5730 to 5739>", "usage", "bot-port <5730 to 5739>")
+    port, old = int(args[0]), port_of()
+    for b in bots():
+        if b != BOT and port_of(b) == port:
+            raise Fail("UDP port %d is already bot %d's" % (port, b), "port_used", port, b)
+    set_env_keys({"UDP_PORT": str(port)})
+    if old != port:
+        firewall(old, False)
+    kind, done = firewall(port, True)
+    note("admin", do="port", port=port)
+    res = {"ok": True, "port": port, "firewall": kind, "firewall_done": done}
+    if service_state()[0] == "active":
+        res["restart"] = cmd_restart(noted=False)
+    return res
+
+
+def set_env_keys(values, path=None, mode=0o600):
+    """Some keys of an env file changed or added (the bot's by default), its other lines kept."""
+    path = path or bot_env()
+    try:
+        with open(path) as f:
+            lines = f.read().splitlines()
+    except FileNotFoundError:                               # (v150-host beta 16: a file that is there and cannot be read is
+        lines = []                                          # never written anew with these keys alone: the call ends on its error)
+    done, new = set(), []
+    for line in lines:
+        k = line.split("=", 1)[0].strip() if "=" in line and not line.lstrip().startswith("#") else None
+        if k in values:
+            new.append("%s=%s" % (k, values[k]))
+            done.add(k)
+        else:
+            new.append(line)
+    new += ["%s=%s" % (k, v) for k, v in values.items() if k not in done]
+    write_atomic(path, "\n".join(new) + "\n", mode)
+
+
+# ---- commands --------------------------------------------------------------------------------------
+def host_command(line):
+    run = os.path.join(bot_state(), "run")
+    if not os.path.isdir(run):
+        raise Fail("bot %d is not running" % BOT, "not_running", BOT)
+    try:                                                   # (the run folder is the game's user's: never through a link)
+        safe_write(os.path.join(run, "cmd.txt"), line + "\n", append=True, owner=True)
+    except OSError as e:
+        raise Fail("bot %d's command file cannot be written (%s)" % (BOT, e.strerror or e), "unsafe_file", BOT)
+
+
+def cmd_kick(args):
+    need_bot()
+    if not args or not re.match(r"^(P\d{1,2}|[\x21-\x7e][\x20-\x7e]{0,15})$", args[0]):
+        raise Fail("kick <P3|name>", "usage", "kick <P3 / name>")
+    host_command("kick " + args[0])
+    note("admin", do="kick", a=args[0])
+    return {"ok": True}
+
+
+def lists_read():
+    """The server's blacklist and the bot's whitelist: (black, white, white_only)."""
+    def names(path, white):
+        out, only = [], False
+        try:
+            with open(path) as f:
+                for line in f:
+                    n = line.strip().upper()
+                    if not n or n.startswith("#"):
+                        continue
+                    if white and n.startswith("ONLY") and "=" in n:
+                        only = n.split("=", 1)[1].strip() in ("ON", "YES", "1", "TRUE")
+                        continue
+                    if n not in out:
+                        out.append(n)
+        except OSError:
+            pass
+        return out, only
+    black, _ = names(BANS_FILE, False)
+    white, only = names(bot_white(), True)
+    return black, white, only
+
+
+def lists_write(black, white, only):
+    write_atomic(BANS_FILE, "# MGO1 dedicated host: the blacklist of every bot of this server, names kicked as soon as they join\n" +
+                 "".join(n + "\n" for n in black))
+    write_atomic(bot_white(), "# MGO1 dedicated host: the whitelist of bot %d\n# only = on: only these names may play "
+                 "(the others are kicked as soon as they join)\nonly = %s\n" % (BOT, "on" if only else "off") +
+                 "".join(n + "\n" for n in white))
+
+
+def lists_json(black, white, only):
+    return {"ok": True, "black": black, "white": white, "white_only": only, "bans": black}
+
+
+def cmd_lists(c, args):
+    need_bot()
+    black, white, only = lists_read()
+    if c == "whitelist-only":
+        if not args or args[0] not in ("on", "off"):
+            raise Fail("whitelist-only <on|off>", "usage", "whitelist-only <on / off>")
+        if args[0] == "on" and not white:
+            raise Fail("the whitelist is empty: add names first", "white_empty")
+        only = args[0] == "on"
+        lists_write(black, white, only)
+        note("admin", do="white-only", on=only)
+    elif c != "lists":
+        if not args:
+            raise Fail(c + " <name>...", "usage", c + " <name>...")
+        for a in args:
+            n = a.strip().upper()
+            if not PLAYER_RE.match(n) or n.startswith("#"):
+                raise Fail("a player's name: 1 to 16 letters, digits or signs", "player_name")
+            if c == "blacklist-add":
+                black = black + [n] if n not in black else black
+                white = [x for x in white if x != n]
+            elif c == "blacklist-remove":
+                black = [x for x in black if x != n]
+            elif c == "whitelist-add":
+                white = white + [n] if n not in white else white
+                black = [x for x in black if x != n]
+            elif c == "whitelist-remove":
+                white = [x for x in white if x != n]
+            note("admin", do=c, a=n)
+        if only and not white:
+            only = False
+        lists_write(black, white, only)
+    return lists_json(black, white, only)
+
+
+def cmd_restart(noted=True):
+    need_bot()
+    svc, _ = service_state()
+    host, age = read_status()
+    if noted:
+        note("admin", do="restart")
+    if svc == "active" and host is not None and age is not None and age < 15:
+        host_command("quit")                       # the game ends at once, the service starts a new one
+        return {"ok": True, "how": "quit"}
+    rc, so, se = systemctl("restart", service())
+    if rc:
+        raise Fail("systemctl restart: " + (se.strip() or so.strip()), "systemctl", (se.strip() or so.strip()).replace("|", " "))
+    return {"ok": True, "how": "systemctl"}
+
+
+def cmd_service(action):
+    need_bot()
+    if action == "start":
+        kv = read_kv(bot_env())
+        if not kv.get("HOST_ACCOUNT_ID") or not kv.get("HOST_ACCOUNT_PASSWORD"):
+            raise Fail("bot %d has no SaveMGO account yet" % BOT, "no_account", BOT)
+    args = {"stop": ["disable", "--now", service()], "start": ["enable", "--now", service()]}[action]
+    note("admin", do=action)
+    rc, so, se = systemctl(*args, timeout=60)
+    if rc:
+        raise Fail("systemctl %s: %s" % (action, (se.strip() or so.strip())), "systemctl", (se.strip() or so.strip()).replace("|", " "))
+    return {"ok": True}
+
+
+def settings_parse(text):
+    kv = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        kv[k.strip()] = v.strip()
+    return kv
+
+
+def settings_check(d):
+    clean = {}
+    for k, v in d.items():
+        if k not in SETTING_KEYS:
+            raise Fail("unknown setting " + k, "setting_unknown", k)
+        kind = SETTING_KEYS[k]
+        v = str(v).strip()
+        if kind[0] == "text":
+            if len(v) > kind[2] or (v and len(v) < kind[1]) or (k == "name" and len(v) < kind[1]):
+                raise Fail("%s: %d to %d characters" % (k, kind[1], kind[2]), "setting_len", k, kind[1], kind[2])
+            if any(ord(ch) < 32 or ord(ch) > 126 for ch in v):
+                raise Fail(k + ": plain ASCII characters only (the game's keyboard)", "setting_ascii", k)
+            if k == "password" and v and not NAME_RE.match(v):
+                raise Fail("password: letters, digits, - _ . only", "setting_pw")
+        elif kind[0] == "int":
+            if not re.fullmatch(r"\d+", v) or not kind[1] <= int(v) <= kind[2]:
+                raise Fail("%s: %d to %d" % (k, kind[1], kind[2]), "setting_range", k, kind[1], kind[2])
+        elif kind[0] == "switch":
+            if v.lower() not in ("on", "off"):
+                raise Fail(k + ": on or off", "setting_onoff", k)
+            v = v.lower()
+        elif kind[0] == "rotation":
+            pairs = [x.strip() for x in v.split(",") if x.strip()]
+            if not 1 <= len(pairs) <= 15:
+                raise Fail("rotation: 1 to 15 rule:map pairs", "rotation")
+            for pr in pairs:
+                m = ROTATION_PAIR.fullmatch(pr)
+                if not m or (int(m.group(1)), int(m.group(2))) not in ROTATION_PLAYS:
+                    raise Fail("rotation: " + ROTATION_TEXT + " (" + pr + ")", "rotation_pair", pr)
+            v = ", ".join(pairs)
+        clean[k] = v
+    # (v141 beta 5) REIKO HINOMOTO/ROWDY REIKO take two unique characters' places: the unique characters on with them (as
+    # the game has them then)
+    if clean.get("rumble_roses") == "on":
+        clean["unique_characters"] = "on"
+    return clean
+
+
+def host_list_9():
+    """(v141 beta 5) server.env HOST_LIST_9_AS_8: how a Host Only game of 9 (8 players) is told to the lobby: 9 (00/08 in
+    the host list; a PC needs an MGO1.exe that judges a big game by the list's hint) or 8 (00/07, beta 4's: the MGO1.exe
+    of v141 joins it). (v141 beta 6) developer compatibility only."""
+    return 8 if read_kv(SERVER_ENV).get("HOST_LIST_9_AS_8", "0") == "1" else 9
+
+
+# ---- (v150-host beta 22, sync) the game settings: one copy saved (bot<N>.game), what the running game plays, this server's maps
+# MGO1 Host's GAME page and the bot's file are the same settings: bot<N>.game is the one copy every reader takes (the next
+# game's launcher, the doll lobby's listing until the game says its own). What a running game plays is the copy its launcher
+# made at its start (run/game.src, exact; run/game.ini, what the game read: less the maps this server does not have) and the
+# rotation it made (its status's): a save reaches the next game, or this one at once with --restart. settings-get says
+# which keys the running game does not play yet ("pending"), the rotation's entries it left out ("left_out"), this
+# server's maps ("maps_here") and the saved copy's version, which settings-set --base <version> checks (a form older than
+# the file refused: "settings_changed", nothing written).
+def game_text(n=None):
+    """bot<N>.game's text ("" when there is none)."""
+    try:
+        with open(bot_game(n), encoding="utf-8", errors="replace") as f:
+            return f.read()
+    except OSError:
+        return ""
+
+
+def settings_version(text):
+    """A settings file's version: the first 16 hex digits of its text's SHA-256; "" for none or an empty one."""
+    return hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()[:16] if text.strip() else ""
+
+
+def rotation_pairs(v):
+    """A rotation's text as [(rule, map)], in its order."""
+    return [(int(a), int(b)) for a, b in re.findall(r"(\d+)\s*:\s*(\d+)", str(v or ""))]
+
+
+def settings_norm(kv):
+    """Settings as the game takes them, to compare two copies: the rotation as its pairs, the switches in small letters, the
+    numbers as numbers; an unknown key as it is."""
+    out = {}
+    for k, v in kv.items():
+        v = str(v).strip()
+        kind = SETTING_KEYS.get(k, ("text",))[0]
+        if kind == "rotation":
+            out[k] = rotation_pairs(v)
+        elif kind == "switch":
+            out[k] = v.lower()
+        elif kind == "int" and re.fullmatch(r"\d+", v):
+            out[k] = int(v)
+        else:
+            out[k] = v
+    return out
+
+
+def maps_dir(n=None):
+    """The PC maps' folder bot n's game is given (host/mgo1host.sh: MAPS_DIR from server.env or bot<N>.env, else the
+    install's maps folder)."""
+    kv = read_kv(SERVER_ENV)
+    kv.update(read_kv(bot_env(n)))
+    return kv.get("MAPS_DIR") or os.path.join(HOME_DIR, "maps")
+
+
+def maps_here(n=None):
+    """The map numbers bot n's games can play: the twelve disc maps, and each PC map (13 ..) of the table whose folder in the
+    maps folder holds a map.ini naming it (id = 13; the game reads them so). A PC map whose files are there but which the game
+    cannot build from this disc is left out by the game itself (settings-get's "left_out")."""
+    here = {m["id"] for m in MAPS if not m["pc_only"]}
+    for ini in glob.glob(os.path.join(maps_dir(n), "*", "map.ini")):
+        try:
+            with open(ini, encoding="utf-8", errors="replace") as f:
+                ids = [int(m.group(1)) for m in (re.match(r"\s*id\s*=\s*(\d+)", line) for line in f) if m]
+            if ids:
+                here.add(ids[-1])                    # (sync2, the review's S6: the last id line, as the game reads it)
+        except OSError:
+            pass
+    return sorted(i for i in here if any(m["id"] == i for m in MAPS))
+
+
+def game_running(n=None):
+    """What bot n's running (or starting) game plays: {"started": the settings its launcher copied at its start (run/game.src;
+    a launcher before beta 22: run/game.ini), "made": the rotation its status says it made ([(rule, map)]; None before it
+    says it), "real": its real players now}; None when no game of it runs."""
+    run = os.path.join(bot_state(n), "run")
+    svc, _ = service_state(n)
+    proc = host_process(n)
+    # (sync2, the review's S5) no game process and the service "activating": a start waiting (its ExecStartPre's wait after
+    # early ends, or systemd's 5 s before a restart), the run folder still the last game's: no game runs. "active" with no
+    # game process: its launcher is starting it (the run folder its own, game.src the file as it is now)
+    if proc is None and svc != "active":
+        return None
+    src = safe_read(os.path.join(run, "game.src"))
+    started = src if src is not None else safe_read(os.path.join(run, "game.ini"))
+    if started is None:
+        return None
+    host, age = read_status(n)
+    made, real = None, 0
+    if proc is not None and host and age is not None and age < 60:
+        rules = (host.get("game") or {}).get("rules")
+        if isinstance(rules, list) and rules:
+            try:
+                made = [(int(p[0]), int(p[1])) for p in rules]
+            except (TypeError, ValueError, IndexError):
+                made = None
+        real, _ = player_kinds([p for p in host.get("players", []) if isinstance(p, dict) and not p.get("host")])
+    return {"started": settings_parse(started), "made": made, "real": real, "process": proc is not None}
+
+
+def settings_sync(saved, n=None):
+    """settings-get's and settings-set's account of a bot's settings: the saved copy's version, the running game's settings
+    ("applied", None when none runs), the keys saved that it does not play yet ("pending"), the rotation's entries it left
+    out ("left_out", "r:m"), this server's maps, its real players."""
+    run = game_running(n)
+    res = {"version": settings_version(saved), "maps_here": maps_here(n), "running": run is not None, "applied": None,
+           "applied_rotation": None, "pending": [], "left_out": [], "real_players": run["real"] if run else 0, "settings_sync": True}
+    if run is None:
+        return res
+    now, was = settings_norm(settings_parse(saved)), settings_norm(run["started"])
+    res["applied"] = run["started"]
+    res["pending"] = [k for k in list(SETTING_KEYS) + sorted(set(now) | set(was)) if (k in now or k in was) and now.get(k) != was.get(k)]
+    res["pending"] = list(dict.fromkeys(res["pending"]))
+    if run["made"] is not None:
+        res["applied_rotation"] = ", ".join("%d:%d" % p for p in run["made"])
+        res["left_out"] = list(dict.fromkeys("%d:%d" % p for p in was.get("rotation", []) if p not in run["made"]))
+    return res
+
+
+def cmd_settings_get():
+    need_bot()
+    text = game_text()
+    res = {"ok": True, "settings": settings_parse(text), "keys": {k: list(v) for k, v in SETTING_KEYS.items()},
+           "host_list_9": host_list_9()}
+    res.update(settings_sync(text))
+    return res
+
+
+def cmd_host_list_9(args):
+    """host-list-9 9|8: how a Host Only game of 9 is told to the lobby (server.env HOST_LIST_9_AS_8); every bot takes it at
+    its next start. (v141 beta 6) developer compatibility only."""
+    if len(args) != 1 or args[0] not in ("9", "8"):
+        raise Fail("host-list-9 9|8", "usage", "host-list-9 9|8")
+    set_env_keys({"HOST_LIST_9_AS_8": "1" if args[0] == "8" else "0"}, SERVER_ENV, 0o644)
+    note("admin", do="host-list-9", a=args[0])
+    return {"ok": True, "host_list_9": host_list_9()}
+
+
+def cmd_settings_set(args):
+    need_bot()
+    try:
+        d = json.loads(sys.stdin.read() or "{}")
+    except ValueError:
+        raise Fail("settings: a JSON object on stdin", "json")
+    if not isinstance(d, dict):
+        raise Fail("settings: a JSON object on stdin", "json")
+    clean = settings_check(d)
+    # (v150-host beta 22, sync) a rotation entry on a map this server does not have (a PC map 13 .. with no map.ini in its maps
+    # folder) is refused: beta 21 saved it, the launcher left it out and, with none left, the game kept its account's last
+    # rotation from SaveMGO's lobby (the earlier settings)
+    here = maps_here()
+    for pr in [x.strip() for x in clean.get("rotation", "").split(",") if x.strip()]:
+        if int(pr.split(":")[1]) not in here:
+            text = "rotation: map %s is not on this server (no map.ini for it in %s): %s" % (pr.split(":")[1], maps_dir(), pr)
+            raise Fail(text, "rotation_map_missing", pr)
+    # (beta 22, sync) --base <version>: the version of the copy the form was filled from; the file changed since (another
+    # MGO1 Host, the shell): refused, nothing written (MGO1 Host asks whether to replace it)
+    if "--base" in args:
+        i = args.index("--base")
+        base = args[i + 1] if i + 1 < len(args) else ""
+        if base != settings_version(game_text()):
+            raise Fail("the bot's settings were changed on the server since they were read: read them again, or save without --base",
+                       "settings_changed")
+    order = list(SETTING_KEYS)
+    lines = ["# MGO1 dedicated host: the game's settings of bot %d (written by MGO1 Host)" % BOT]
+    lines += ["%s = %s" % (k, clean[k]) for k in order if k in clean]
+    write_atomic(bot_game(), "\n".join(lines) + "\n", 0o644)
+    # (v150-host beta 16) fewer seats than its virtual dolls ask for (max_players lowered after vdoll-set, which alone
+    # checked the count): VDOLL_COUNT follows, as vdoll-set would refuse it now (the players less the host's entry and
+    # the seat kept for a real player). Without this the count shown never plays and the manager warns of it for ever
+    lowered = None
+    most = min(VDOLL_MAX, max(0, game_max_players(BOT) - 2))
+    if vdoll_count_of(read_kv(bot_env()).get("VDOLL_COUNT")) > most:
+        set_env_keys({"VDOLL_COUNT": str(most)})
+        lowered = most
+    more = {} if lowered is None else {"vdoll_count_lowered": lowered}
+    note("admin", do="settings", restart="--restart" in args, **more)
+    res = dict({"ok": True, "settings": clean}, **more)
+    # (beta 22, sync) the saved copy's new version, what the running game plays, and when the save takes effect: "now" (a new
+    # game asked), "next game" (a game runs and keeps what it started with: --restart or the restart command to play them at
+    # once), "next start" (no game runs)
+    res.update(settings_sync(game_text()))
+    if "--restart" in args:
+        res["restart"] = cmd_restart(noted=False)
+        res["takes_effect"], res["pending"], res["left_out"] = "now", [], []
+    else:
+        res["takes_effect"] = "next game" if res["running"] else "next start"
+    return res
+
+
+def cmd_account_get():
+    need_bot()
+    kv = read_kv(bot_env())
+    return {"ok": True, "id": kv.get("HOST_ACCOUNT_ID", ""), "password_set": bool(kv.get("HOST_ACCOUNT_PASSWORD", "")),
+            "udp_port": port_of()}
+
+
+def cmd_account_set():
+    need_bot()
+    try:
+        d = json.loads(sys.stdin.read() or "{}")
+    except ValueError:
+        raise Fail("account: a JSON object on stdin", "json")
+    # MGO1 accounts are in capitals
+    acc_id = str(d.get("id", "")).strip().upper()
+    pw = str(d.get("password", "")).upper()
+    if not NAME_RE.match(acc_id) or not 3 <= len(acc_id) <= 15:
+        raise Fail("account ID: 3 to 15 capitals, digits, - _ .", "account_id")
+    if pw and (not NAME_RE.match(pw) or not 6 <= len(pw) <= 15):
+        raise Fail("password: 6 to 15 capitals, digits, - _ .", "account_pw")
+    if not pw and not read_kv(bot_env()).get("HOST_ACCOUNT_PASSWORD"):
+        raise Fail("password: required", "pw_required")
+    for b in bots():                               # one account, one bot: SaveMGO keeps one session an account
+        if b != BOT and read_kv(bot_env(b)).get("HOST_ACCOUNT_ID", "").upper() == acc_id:
+            raise Fail("this account is already bot %d's" % b, "account_used", b)
+    values = {"HOST_ACCOUNT_ID": acc_id}
+    if pw:
+        values["HOST_ACCOUNT_PASSWORD"] = pw
+    set_env_keys(values)
+    note("admin", do="account")                     # never the account itself: logs are shared
+    return {"ok": True, "id": acc_id}
+
+
+def servers_now():
+    kv = {}
+    try:
+        with open(SERVERS_FILE) as f:
+            for line in f:
+                line = line.split(";", 1)[0].split("#", 1)[0].strip()
+                if "=" in line:
+                    k, v = line.split("=", 1)
+                    kv[k.strip()] = v.strip()
+    except OSError:
+        return dict(SAVEMGO, custom=False)
+    res = dict(SAVEMGO, custom=True)
+    for k in ("web", "gate", "stun"):
+        if kv.get(k):
+            res[k] = kv[k]
+    for k in ("gate_port", "stun_port"):
+        if kv.get(k, "").isdigit():
+            res[k] = int(kv[k])
+    return res
+
+
+def cmd_servers_get():
+    return {"ok": True, "servers": servers_now(), "savemgo": SAVEMGO, "slots": SLOTS}
+
+
+def cmd_servers_set(args):
+    try:
+        d = json.loads(sys.stdin.read() or "{}")
+    except ValueError:
+        raise Fail("servers: a JSON object on stdin", "json")
+    if not d.get("custom"):
+        try:
+            os.remove(SERVERS_FILE)
+        except OSError:
+            pass
+        new = dict(SAVEMGO, custom=False)
+    else:
+        new = {"custom": True}
+        host_re = re.compile(r"^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$")
+        for k in ("web", "gate", "stun"):
+            v = str(d.get(k, "")).strip()
+            if not v or len(v) > SLOTS[k]:
+                raise Fail("%s: 1 to %d characters" % (k, SLOTS[k]), "server_len", k, SLOTS[k])
+            if k == "web" and not re.fullmatch(r"https?://[\x21-\x7e]+", v):
+                raise Fail("web: an address that starts with http:// or https://", "server_web")
+            if k != "web" and not host_re.match(v):
+                raise Fail("%s: an IPv4 address or a host name" % k, "server_host", k)
+            new[k] = v
+        for k in ("gate_port", "stun_port"):
+            v = str(d.get(k, "")).strip()
+            if not v.isdigit() or not 1 <= int(v) <= 65535:
+                raise Fail("%s: 1 to 65535" % k, "server_port", k)
+            new[k] = int(v)
+        write_atomic(SERVERS_FILE, "# MGO1 dedicated host: the servers of every bot (written by MGO1 Host); no file: SaveMGO's\n"
+                     "[servers]\ncase      = 3\nweb       = %(web)s\ngate      = %(gate)s\nstun      = %(stun)s\n"
+                     "gate_port = %(gate_port)d\nstun_port = %(stun_port)d\n" % new, 0o644)
+    global BOT
+    restarted = []
+    for b in bots():
+        BOT = b
+        note("admin", do="servers", custom=bool(new.get("custom")))
+        if "--restart" in args and service_state(b)[0] == "active":
+            cmd_restart(noted=False)
+            restarted.append(b)
+    return {"ok": True, "servers": new, "restarted": restarted}
+
+
+# the lines of the bot's journal that tell what happens (MGO1 Host.exe shows them in its language);
+# the others are the host's technical lines. ESSENTIAL_MESSAGE: the same for journalctl --grep (the
+# message alone), which finds them in the whole journal however many technical lines came after
+ESSENTIAL = re.compile(r"mgo1host: |HOST_ACCOUNT_\w+ is not set|: (Started|Stopped|Stopping) |Main process exited|Scheduled restart job"
+                       r"|Deactivated successfully|Failed with result|ps2 f\d+: (text: |host watch: |host settings|lists: |blacklist: "
+                       r"|whitelist: |kick P|command )|: step \d+: \"|RESULT ")
+ESSENTIAL_MESSAGE = (r"^mgo1host: |HOST_ACCOUNT_\w+ is not set|^(Started|Stopped|Stopping) |Main process exited|Scheduled restart job"
+                     r"|Deactivated successfully|Failed with result|^ps2 f\d+: (text: |host watch: |host settings|lists: |blacklist: "
+                     r"|whitelist: |kick P|command )|^step \d+: \"|^RESULT ")
+
+
+def cmd_log(args):
+    """log [lines] [--essential]: the last lines of the bot's journal, the log-in data masked."""
+    need_bot()
+    n = int(args[0]) if args and args[0].isdigit() else 200
+    essential = "--essential" in args
+    base = [tool("journalctl"), "-u", service(), "--no-pager", "-o", "short-iso"]
+    rc, so, se = 1, "", ""
+    if essential:                                    # the whole journal, filtered by journalctl itself
+        # ((v141 beta 4) the last 7 days: the whole journal was read back every 5 s when such lines were few)
+        rc, so, se = sh(base + ["-n", str(min(n, 2000)), "--since", "-7d", "--grep", ESSENTIAL_MESSAGE], 60)
+        if rc == 1 and not se.strip():
+            rc = 0                                   # no line matches: journalctl says so with 1
+    if not essential or rc:                          # or the last lines, filtered here (a journalctl without --grep)
+        rc, so, se = sh(base + ["-n", str(40000 if essential else min(n, 2000))], 60)
+    if rc and not so:
+        raise Fail("journalctl: " + se.strip(), "journal", se.strip().replace("|", " "))
+    lines = so.splitlines()
+    if essential:
+        lines = [x for x in lines if ESSENTIAL.search(x)]
+    sec = secrets()
+    return {"ok": True, "lines": [redact(x, sec) for x in lines[-min(n, 2000):]]}
+
+
+# ---- the daily logs (host/mgo1log): a folder per bot, doll and the doll manager, a file per day (UTC) ----
+LOG_SOURCE_RE = re.compile(r"^(bot([1-9]|10)|doll([1-9]|[1-5][0-9]|6[0-4])|manager)$")
+DAY_RE = re.compile(r"^\d{4}-\d\d-\d\d$")
+
+
+def log_sort_key(name):
+    m = re.match(r"^(bot|doll)(\d+)$", name)
+    return (0 if name.startswith("bot") else 1 if name.startswith("doll") else 2, int(m.group(2)) if m else 0)
+
+
+def cmd_logs(args):
+    """logs [list]: the sources and their days; logs get <source> <day> [...]: that day's lines."""
+    if not args or args[0] == "list":
+        out_ = []
+        try:
+            names = sorted((n for n in os.listdir(LOG_ROOT) if LOG_SOURCE_RE.match(n)), key=log_sort_key)
+        except OSError:
+            names = []
+        limit = time.strftime("%Y-%m-%d", time.gmtime(time.time() - 31 * 86400))
+        for n in names:
+            days = []
+            for p in sorted(glob.glob(os.path.join(LOG_ROOT, n, "*.log")), reverse=True):
+                day = os.path.basename(p)[:10]
+                if not DAY_RE.match(day):
+                    continue
+                if day < limit:                       # (mgo1log removes them; an idle source keeps them until then)
+                    for q in (p, p[:-4] + ".sum"):
+                        try:
+                            os.remove(q)
+                        except OSError:
+                            pass
+                    continue
+                info = {"day": day, "size": 0}
+                try:
+                    info["size"] = os.path.getsize(p)
+                except OSError:
+                    pass
+                try:
+                    with open(p[:-4] + ".sum", encoding="utf-8") as f:
+                        sm = json.load(f)
+                    if isinstance(sm, dict):
+                        for k in ("lines", "E", "W", "starts", "crashes", "first", "last"):
+                            if k in sm:
+                                info[k] = sm[k]
+                except (OSError, ValueError):
+                    pass
+                days.append(info)
+            if days:
+                out_.append({"source": n, "days": days})
+        return {"ok": True, "logs": out_, "now": int(time.time() * 1000)}
+    if args[0] != "get" or len(args) < 3:
+        raise Fail("logs [list] | logs get <source> <day>", "usage", "logs get <bot1|doll1|manager> <YYYY-MM-DD>")
+    src, day = args[1], args[2]
+    if not LOG_SOURCE_RE.match(src) or not DAY_RE.match(day):
+        raise Fail("logs get <bot1..10|doll1..64|manager> <YYYY-MM-DD>", "usage", "logs get <bot1|doll1|manager> <YYYY-MM-DD>")
+    opt = {}
+    i = 3
+    while i < len(args):
+        if args[i] in ("--level", "--from", "--lines", "--find", "--tail") and i + 1 < len(args):
+            opt[args[i]] = args[i + 1]
+            i += 2
+        else:
+            i += 1
+    level = opt.get("--level", "")
+    first = int(opt["--from"]) if opt.get("--from", "").isdigit() else 0
+    most = max(1, min(int(opt["--lines"]) if opt.get("--lines", "").isdigit() else 2000, 5000))
+    find = opt.get("--find", "").upper()
+    path = os.path.join(LOG_ROOT, src, day + ".log")
+    if not os.path.isfile(path):
+        raise Fail("no log of %s on %s" % (src, day), "no_log", src, day)
+    sec = secrets()
+    # (2.6) --tail N: the day's last N lines (the newest: what went wrong just now), "from" their first one's number
+    tail = max(1, min(int(opt["--tail"]), 5000)) if opt.get("--tail", "").isdigit() else 0
+    lines, n, total = [], 0, 0
+    last = collections.deque(maxlen=tail) if tail else None
+    with open(path, encoding="utf-8", errors="replace") as f:
+        for line in f:
+            line = line.rstrip("\n")
+            parts = line.split(" ", 2)
+            lv = parts[1] if len(parts) > 2 and parts[1] in ("E", "W", "I") else "I"
+            if level and lv not in level:
+                continue
+            if find and find not in line.upper():
+                continue
+            total += 1
+            if last is not None:
+                last.append(line)
+            elif n >= first and len(lines) < most:
+                lines.append(redact(line, sec))
+            n += 1
+    if last is not None:
+        first = total - len(last)
+        lines = [redact(x, sec) for x in last]
+    return {"ok": True, "source": src, "day": day, "lines": lines, "from": first, "total": total,
+            "next": first + len(lines) if first + len(lines) < total else -1}
+
+
+# ---- (v150-host beta 16) a day's view when the file is too long for an export; the crash reports -------------------------
+LOG_VIEW_LINES = int(os.environ.get("MGO1_LOG_VIEW_LINES", "100000"))   # the lines of a day's view (MGO1 Host's SAVE takes the last 100000)
+LOG_VIEW_BURST = 200                                         # a shape's lines shown in 10 s of the log's own clock (mgo1log's MGO1_LOG_BURST)
+# a number as mgo1log's flood guard takes it (host/mgo1log NUMBER, NUMBER_BYTES): a line's shape is its text less its numbers
+LOG_NUMBER = re.compile(r"\b(?:0x)?[0-9a-fA-F]*[0-9][0-9a-fA-F]*\b|\b[a-fA-F]{8,}\b")
+LOG_NUMBER_BYTES = b"0123456789abcdefABCDEFxX"
+CRASH_NAME_RE = re.compile(r"^(\d{4})-(\d\d)-(\d\d)_(\d\d)(\d\d)(\d\d)_([a-z0-9]{1,16})(?:_\d)?\.txt$")
+
+
+def log_view(path, level, find):
+    """A day's file as it is shown when it holds more lines than a view takes: (offsets, notes, flood, lines). offsets: the
+    file's place of each line shown, or -(k + 1) for notes[k], a line of the agent's own that stands for a flood's lines
+    (as mgo1log's guard writes them since beta 16; a file written before has them line by line): of each shape, 200 lines
+    at most in 10 s of the log's clock are shown, none while the shape goes on from the 10 s before, and the rest counted
+    with the first and the last one's own numbers. flood: the lines so left out; lines: those that pass the filters."""
+    import array
+    offsets, notes = array.array("q"), []
+    flood = lines = off = 0
+    bucket, seen, shapes, order, carried, last_stamp = None, {}, {}, [], {}, b""
+
+    def close():
+        """The 10 s end: a note for each shape with lines left out; those shapes go on into the next 10 s."""
+        nonlocal seen, shapes, order, carried
+        nxt, keys = {}, {}
+        for sh in order:
+            r = shapes[sh]
+            if r[1]:
+                notes.append("%s W mgo1host-agent: %d more lines like \"%s\", the first at %s%s, the last at %s%s (not shown one by one)" % (
+                    last_stamp.decode("ascii", "replace"), r[1], sh if len(sh) <= 200 else sh[:197] + "...", r[2][11:23], r[3], r[4][11:23], r[5]))
+                offsets.append(-len(notes))
+                nxt[sh] = True
+                keys[r[6]] = True
+        seen, shapes, order, carried = keys, {}, [], nxt
+
+    def numbers(text):
+        v = " ".join(LOG_NUMBER.findall(text)[:8])
+        return " (%s)" % v[:120] if v else ""
+
+    with open(path, "rb") as f:
+        for raw in f:
+            here, off = off, off + len(raw)
+            parts = raw.split(b" ", 2)
+            lv = parts[1] if len(parts) > 2 and parts[1] in (b"E", b"W", b"I") else b"I"
+            if level and lv.decode() not in level:
+                continue
+            if find and find not in raw.decode("utf-8", "replace").upper():
+                continue
+            lines += 1
+            if raw[:18] != bucket:                           # the log's own clock: 10 s by 10 s
+                if bucket is not None:
+                    close()
+                bucket = raw[:18]
+            last_stamp = raw[:24]
+            body = parts[2] if len(parts) > 2 else raw
+            key = body.translate(None, LOG_NUMBER_BYTES)
+            n = seen.get(key, 0)
+            if n is not True:
+                if n < LOG_VIEW_BURST or lv == b"E":
+                    seen[key] = n + 1
+                    offsets.append(here)
+                    continue
+                seen[key] = True                             # lines alike less their numbers past a burst: their shapes counted
+            text = body.decode("utf-8", "replace").rstrip("\r\n")
+            sh = LOG_NUMBER.sub("<n>", text)
+            r = shapes.get(sh)
+            if r is None:
+                r = shapes[sh] = [LOG_VIEW_BURST if sh in carried or lv == b"E" else 0, 0, "", "", "", "", key]
+                order.append(sh)
+            if lv == b"E" or (r[0] < LOG_VIEW_BURST and sh not in carried):
+                r[0] += 1
+                offsets.append(here)
+                continue
+            stamp = raw[:24].decode("ascii", "replace")
+            if not r[1]:
+                r[2], r[3] = stamp, numbers(text)
+            r[1] += 1
+            r[4], r[5] = stamp, numbers(text)
+            flood += 1
+    if bucket is not None:
+        close()
+    return offsets, notes, flood, lines
+
+
+def cmd_logs_view(args):
+    """(v150-host beta 16) logs, with a day's view that an export can hold. MGO1 Host's SAVE takes the last 100000 lines of
+    `logs get`'s view (5000 a call from total - 100000): of a day flooded before the flood guard (9 and 10 November 2026:
+    640000 lines a wild address each) it held the flood alone. A day's file of more than LOG_VIEW_LINES lines is shown less
+    its floods' lines (log_view), then less its oldest lines by whole blocks (a view that grows keeps its numbers), and the
+    view's first line says how many lines the day holds and how many are left out. --raw, a shorter file, the list: cmd_logs
+    as it was."""
+    if len(args) < 3 or args[0] != "get" or "--raw" in args:
+        return cmd_logs([a for a in args if a != "--raw"])
+    src, day = args[1], args[2]
+    path = os.path.join(LOG_ROOT, src, day + ".log")
+    if not LOG_SOURCE_RE.match(src) or not DAY_RE.match(day) or not os.path.isfile(path):
+        return cmd_logs(args)                                # (its errors)
+    file_lines = 0
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(1 << 20), b""):
+            file_lines += block.count(b"\n")
+    if file_lines <= LOG_VIEW_LINES:
+        return cmd_logs(args)
+    opt, i = {}, 3
+    while i < len(args):
+        if args[i] in ("--level", "--from", "--lines", "--find", "--tail") and i + 1 < len(args):
+            opt[args[i]] = args[i + 1]
+            i += 2
+        else:
+            i += 1
+    first = int(opt["--from"]) if opt.get("--from", "").isdigit() else 0
+    most = max(1, min(int(opt["--lines"]) if opt.get("--lines", "").isdigit() else 2000, 5000))
+    tail = max(1, min(int(opt["--tail"]), 5000)) if opt.get("--tail", "").isdigit() else 0
+    offsets, notes, flood, lines = log_view(path, opt.get("--level", ""), opt.get("--find", "").upper())
+    block = max(1, LOG_VIEW_LINES // 10)
+    room = LOG_VIEW_LINES - 1                                # (the first line is the agent's own)
+    cut = 0 if len(offsets) <= room else -(-(len(offsets) - room) // block) * block
+    head = []
+    if flood or cut:
+        left = []
+        if flood:
+            left.append("%d of them, the lines of floods (summarised below: \"more lines like\")" % flood)
+        if cut:
+            left.append("its %d oldest lines (it shows %d at most)" % (cut, LOG_VIEW_LINES))
+        head = ["mgo1host-agent: this day's file holds %d lines: this view leaves out %s; logs get ... --raw: the file as it is" % (lines, " and ".join(left))]
+    total = len(head) + len(offsets) - cut
+    if tail:
+        first = max(0, total - tail)
+        most = tail
+    sec = secrets()
+    out_ = []
+    with open(path, "rb") as f:
+        for n in range(first, min(total, first + most)):
+            k = n - len(head)
+            if k < 0:                                        # the agent's line, at the time of the first line shown
+                o = offsets[cut] if cut < len(offsets) else -1
+                stamp = notes[-o - 1][:24] if o < 0 else ""
+                if o >= 0:
+                    f.seek(o)
+                    stamp = f.read(24).decode("ascii", "replace")
+                out_.append("%s W %s" % (stamp if re.match(r"^\d{4}-\d\d-\d\dT", stamp) else day + "T00:00:00.000Z", head[0]))
+                continue
+            o = offsets[cut + k]
+            if o < 0:
+                out_.append(redact(notes[-o - 1], sec))
+            else:
+                f.seek(o)
+                out_.append(redact(f.readline().decode("utf-8", "replace").rstrip("\n"), sec))
+    return {"ok": True, "source": src, "day": day, "lines": out_, "from": first, "total": total,
+            "next": first + len(out_) if first + len(out_) < total else -1, "file_lines": lines, "flood": flood, "cut": cut}
+
+
+def crash_sources(args):
+    """The log folders asked for: -b <bot>, --doll <n> (or --bot <bot> before the command), else every bot's and doll's."""
+    for flag, kind, most in (("-b", "bot", MAX_BOTS), ("--doll", "doll", 64)):
+        if flag in args:
+            i = args.index(flag)
+            if i + 1 >= len(args) or not args[i + 1].isdigit() or not 1 <= int(args[i + 1]) <= most:
+                raise Fail("crashes [-b <bot> | --doll <n>]", "usage", "crashes [-b <bot> | --doll <n>]")
+            return ["%s%d" % (kind, int(args[i + 1]))]
+    if "--bot" in sys.argv:
+        return ["bot%d" % BOT]
+    try:
+        return sorted((n for n in os.listdir(LOG_ROOT) if LOG_SOURCE_RE.match(n) and n != "manager"), key=log_sort_key)
+    except OSError:
+        return []
+
+
+def crash_head(path, sec):
+    """A report's header (host/mgo1log crash_report: "key: value" lines before "----"): its fields, the players' lines apart,
+    the round's rule and map by their names."""
+    head, players = {}, []
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            for n, line in enumerate(f):
+                line = line.rstrip("\n")
+                if line == "----" or n > 200:
+                    break
+                k, sep, v = line.partition(": ")
+                if not sep or not re.match(r"^[a-z_]{1,16}$", k):
+                    continue
+                if k in ("player", "vdoll"):                 # (a line each: "who")
+                    players.append(redact(v if k == "player" else "virtual doll " + v, sec))
+                else:
+                    head[k] = redact(v, sec)
+    except OSError:
+        return {}, []
+    m = re.search(r"\(rule (\d+), map (\d+)\)", head.get("round", ""))
+    if m:
+        head["rule"], head["map"] = int(m.group(1)), int(m.group(2))
+        head["rule_name"] = next((r["name"] for r in RULES if r["id"] == head["rule"]), "")
+        head["map_name"] = next((x["name"] for x in MAPS if x["id"] == head["map"]), "")
+    return head, players
+
+
+def crash_item(src, name, sec):
+    path = os.path.join(LOG_ROOT, src, "crash", name)
+    m = CRASH_NAME_RE.match(name)
+    head, players = crash_head(path, sec)
+    item = {"source": src, "name": name, "reason": m.group(7), "time": "%s-%s-%sT%s:%s:%sZ" % m.groups()[:6], "size": 0}
+    try:
+        item["size"] = os.path.getsize(path)
+    except OSError:
+        pass
+    item.update({k: v for k, v in head.items() if k not in ("source", "reason")})
+    item["who"] = players
+    return item
+
+
+def cmd_crashes(args):
+    """crashes [-b <bot> | --doll <n>]: the crash reports (docs/CRASH_REPORTS.md), the newest first: each one's source, file,
+    time (UTC), reason (crash70, signal<N>, hung, lost, exit<N>), size and its header's fields (what, when, version, state,
+    game, round with the rule's and the map's names, players, who: the players' lines, pace, wild: the first access outside
+    the memory, lines)."""
+    sec = secrets()
+    out_ = []
+    for src in crash_sources(args):
+        try:
+            names = [n for n in os.listdir(os.path.join(LOG_ROOT, src, "crash")) if CRASH_NAME_RE.match(n)]
+        except OSError:
+            continue
+        out_ += [crash_item(src, n, sec) for n in names]
+    out_.sort(key=lambda x: (x["name"][:17], x["source"]), reverse=True)
+    return {"ok": True, "crashes": out_[:400], "now": int(time.time() * 1000)}
+
+
+def cmd_crash(args):
+    """crash [<source>/]<name> [--from <n>] [--lines <n>] [--tail <n>]: one crash report, its header's fields and its lines
+    (the header's, "----", then the game's last lines), 2000 a call (5000 at most) as logs get; the log-in data masked."""
+    usage = "crash [<bot1|doll1>/]<name> [--from <n>] [--lines <n>] [--tail <n>]"
+    if not args or args[0].startswith("-"):
+        raise Fail(usage, "usage", usage)
+    src, _, name = args[0].rpartition("/")
+    if not CRASH_NAME_RE.match(name) or (src and (not LOG_SOURCE_RE.match(src) or src == "manager")):
+        raise Fail(usage, "usage", usage)
+    found = [x for x in ([src] if src else crash_sources(args[1:])) if os.path.isfile(os.path.join(LOG_ROOT, x, "crash", name))]
+    if not found:
+        raise Fail("no crash report %s" % args[0], "no_crash", args[0])
+    src = found[0]
+    opt, i = {}, 1
+    while i < len(args):
+        if args[i] in ("--from", "--lines", "--tail") and i + 1 < len(args):
+            opt[args[i]] = args[i + 1]
+            i += 2
+        else:
+            i += 1
+    first = int(opt["--from"]) if opt.get("--from", "").isdigit() else 0
+    most = max(1, min(int(opt["--lines"]) if opt.get("--lines", "").isdigit() else 2000, 5000))
+    tail = max(1, min(int(opt["--tail"]), 5000)) if opt.get("--tail", "").isdigit() else 0
+    sec = secrets()
+    item = crash_item(src, name, sec)
+    with open(os.path.join(LOG_ROOT, src, "crash", name), encoding="utf-8", errors="replace") as f:
+        lines = f.read(4 << 20).split("\n")                  # (a report is 2 MB at most)
+    if lines and not lines[-1]:
+        lines.pop()
+    if tail:
+        first = max(0, len(lines) - tail)
+        most = tail
+    page = [redact(x, sec) for x in lines[first:first + most]]
+    item.update({"ok": True, "lines": page, "from": first, "total": len(lines), "next": first + len(page) if first + len(page) < len(lines) else -1})
+    return item
+
+
+def cmd_schedule_set(args):
+    if not args or not re.fullmatch(r"off|([01]\d|2[0-3]):[0-5]\d", args[0]):
+        raise Fail("schedule-set <HH:MM|off>", "usage", "schedule-set <HH:MM / off>")
+    timer = os.path.join(TIMER_DIR, "mgo1host-restart.timer")
+    unit = os.path.join(TIMER_DIR, "mgo1host-restart.service")
+    if args[0] == "off":
+        systemctl("disable", "--now", "mgo1host-restart.timer")
+        return {"ok": True, "schedule": "off"}
+    agent = os.path.abspath(sys.argv[0])
+    write_atomic(unit, "[Unit]\nDescription=MGO1 dedicated host: the daily restart of every bot (once its game is empty)\n\n"
+                 "[Service]\nType=oneshot\nExecStart=%s scheduled-restart\n" % agent)
+    write_atomic(timer, "[Unit]\nDescription=MGO1 dedicated host: the daily restart\n\n[Timer]\n"
+                 "OnCalendar=*-*-* %s:00\nPersistent=false\n\n[Install]\nWantedBy=timers.target\n" % args[0])
+    systemctl("daemon-reload")
+    rc, so, se = systemctl("enable", "--now", "mgo1host-restart.timer")
+    if rc:
+        raise Fail("systemctl enable timer: " + (se.strip() or so.strip()), "systemctl", (se.strip() or so.strip()).replace("|", " "))
+    return {"ok": True, "schedule": args[0]}
+
+
+def cmd_scheduled_restart():
+    """At the scheduled time: every running bot restarts once no one plays in its game (at most an hour later)."""
+    global BOT
+    left = [b for b in bots() if service_state(b)[0] == "active"]
+    done = []
+    for _ in range(121):
+        for b in list(left):
+            BOT = b
+            host, age = read_status()
+            if not [p for p in (host or {}).get("players", []) if not p.get("host")] or _ == 120:
+                note("admin", do="daily-restart")
+                cmd_restart(noted=False)
+                left.remove(b)
+                done.append(b)
+        if not left:
+            break
+        time.sleep(30)
+    return {"ok": True, "restarted": done}
+
+
+def sha256(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for b in iter(lambda: f.read(1 << 20), b""):
+            h.update(b)
+    return h.hexdigest()
+
+
+def build_state():
+    """(build 1.00, srvbuild) the host built on this server from MGO1 Host's public package (install.sh, host/build_server.sh,
+    docs/DEDICATED_HOST.md section 27): its tree kept for updates, what the last build made and how long it took"""
+    tree = os.path.join(HOME_DIR, "build")
+    st = {"tree": os.path.isdir(os.path.join(tree, "src")), "built": False}
+    kv = read_kv(os.path.join(tree, "built.txt"))
+    if kv.get("exe"):
+        try:
+            secs = int(kv.get("seconds") or 0)
+        except ValueError:
+            secs = 0
+        st.update({"built": True, "version": kv.get("version", ""), "exe": kv["exe"][:12], "seconds": secs, "at": kv.get("built", "")})
+    return st
+
+
+def cmd_install_check(args):
+    osr = read_kv("/etc/os-release")
+    files = {}
+    want = ["mgo1host.exe", "disc/MGS/NET/MGS3_N.ELF", "disc/MGS/NET/STAGE_N.DAT", "disc/MGS/NET/SLOT_N.DAT"]
+    for rel in want:
+        p = os.path.join(HOME_DIR, rel)
+        if os.path.isfile(p):
+            files[rel] = {"size": os.path.getsize(p), "sha256": sha256(p) if "--hash" in args else None}
+    ver = ""
+    try:
+        with open(os.path.join(HOME_DIR, "VERSION")) as f:
+            ver = f.read().strip()
+    except OSError:
+        pass
+    wine = shutil.which("wine64") or ("/usr/lib/wine/wine64" if os.path.exists("/usr/lib/wine/wine64") else "")
+    return {"ok": True, "arch": os.uname().machine, "os": osr.get("ID", "").strip('"'), "os_version": osr.get("VERSION_ID", "").strip('"'),
+            "os_name": osr.get("PRETTY_NAME", "").strip('"'), "wine": wine, "version": ver, "files": files,
+            "modules": os.path.isdir(os.path.join(HOME_DIR, "disc/MODULES")), "disk_free_gb": sys_now()["disk_free_gb"],
+            "cores": os.cpu_count() or 1, "build": build_state(),
+            "bots": bots(), "layout": 2 if os.path.isdir(CONF) else (1 if os.path.isfile("/etc/mgo1host.env") else 0)}
+
+
+def cmd_sysinfo():
+    info = sys_now()
+    cpu = ""
+    try:
+        with open("/proc/cpuinfo") as f:
+            m = re.search(r"model name\s*:\s*(.*)", f.read())
+            cpu = m.group(1).strip() if m else ""
+    except OSError:
+        pass
+    info.update({"ok": True, "hostname": os.uname().nodename, "cpu": cpu, "arch": os.uname().machine,
+                 "os": read_kv("/etc/os-release").get("PRETTY_NAME", "").strip('"')})
+    return info
+
+
+def cmd_watch(args):
+    """Every <seconds>: the bot's state, the server's bots every 2 s, and the Game Report's new events
+    (from --since <ms>, else from now)."""
+    need_bot()
+    every = float(args[0]) if args and re.fullmatch(r"[\d.]+", args[0]) else 1.0
+    every = min(max(every, 0.5), 10.0)
+    tail = EventTail()                             # from now on; --since: the ones written since then first
+    first = events_read(int(args[args.index("--since") + 1]), 2000)[0] if "--since" in args else []
+    end = time.time() + 12 * 3600                 # at most 12 h: the program opens a new one
+    prev, slow, slow_at, bots_at, bots_now = None, None, 0.0, 0.0, []
+    while time.time() < end:
+        if time.time() - slow_at > 10:
+            slow_at = time.time()
+            events_prune()
+            slow = {"sys": sys_now(), "schedule": schedule_now()}
+        if time.time() - bots_at > 2:
+            bots_at, bots_now = time.time(), [bot_summary(n) for n in bots()]
+        res, prev = status(prev, dict(slow, bots=bots_now))
+        res["events"] = first + tail.read()
+        first = []
+        out(res)
+        time.sleep(every)
+    return None
+
+
+# ---- the PLAYABLE DOLLs (docs/PLAYABLE_DOLL.md) --------------------------------------------------
+MAX_DOLLS = 64
+# a doll's settings file, its keys in this order ((v141 beta 5) DOLL_NAME: an accountless doll's name in the game; (v141
+# beta 6) DOLL_ADAPT_MIN, DOLL_ADAPT_MAX: the live level's bounds)
+DOLL_KEYS = ("DOLL_ACCOUNT_ID", "DOLL_ACCOUNT_PASSWORD", "DOLL_NAME", "DOLL_BOT", "DOLL_DIFFICULTY", "DOLL_ADAPT",
+             "DOLL_ADAPT_MIN", "DOLL_ADAPT_MAX", "DOLL_TEAM", "DOLL_ENABLED", "DOLL_LOADOUT", "DOLL_ORDER", "DOLL_AIM")
+# (v141 beta 6) the difficulty ladder, 1 to 10 (MGO1Loader/doll_brain.cpp kTierNames; 6 ELITE: beta 5's NIGHTMARE)
+DOLL_TIERS = ("TRAINING", "EASY", "NORMAL", "HARD", "EXPERT", "ELITE", "VETERAN", "MASTER", "EXTREME", "PRO")
+DOLL_LEVELS = tuple(str(i) for i in range(1, len(DOLL_TIERS) + 1))     # the values taken: "1" to "10"
+DOLL_TEAMS = ("auto", "red", "blue", "spectator")
+DOLL_LOADOUTS = ("auto", "scorpion", "xm16", "ak47", "m37", "svd", "mosin")
+DOLL_ORDERS = ("free", "objective", "target", "hide", "defend", "follow")
+DOLL_AIMS = ("pad", "direct")   # (v150-host beta 18) DOLL_AIM: pad (the default, as before) or direct
+
+
+def doll_aim_of(kv):
+    """(v150-host beta 18) A doll's aim as mgo1doll.sh takes it: direct, else pad."""
+    return "direct" if str(kv.get("DOLL_AIM", "")).strip().lower() == "direct" else "pad"
+
+
+def doll_aim_arg(v):
+    """(v150-host beta 18) doll-set's "aim": direct or pad (null or "": pad), else refused."""
+    a = "pad" if v in (None, "") else v.strip().lower() if isinstance(v, str) else v
+    if a not in DOLL_AIMS:
+        raise Fail("aim: direct or pad", "doll_aim", json.dumps(v) if not isinstance(v, str) else v)
+    return a
+
+
+def doll_env(n):
+    return os.path.join(CONF, "doll%d.env" % n)
+
+
+def doll_state(n):
+    return os.path.join(STATE_ROOT, "doll%d" % n)
+
+
+def dolls():
+    """The dolls this server has: their numbers, in order."""
+    res = []
+    for p in glob.glob(os.path.join(CONF, "doll*.env")):
+        m = re.fullmatch(r"doll(\d+)\.env", os.path.basename(p))
+        if m and 1 <= int(m.group(1)) <= MAX_DOLLS:
+            res.append(int(m.group(1)))
+    return sorted(res)
+
+
+def doll_number(args, pos=0):
+    if len(args) <= pos or not args[pos].isdigit() or not 1 <= int(args[pos]) <= MAX_DOLLS:
+        raise Fail("a doll: 1 to %d" % MAX_DOLLS, "usage", "doll 1 to %d" % MAX_DOLLS)
+    return int(args[pos])
+
+
+def doll_level(v, default):
+    """(v141 beta 6) A level of a doll's settings file (1 to 10), else the default (as mgo1doll.sh takes it)."""
+    return int(v) if v in DOLL_LEVELS else default
+
+
+def doll_bounds(kv):
+    """(v141 beta 6) The live level's bounds of a doll's settings: (DOLL_ADAPT_MIN, DOLL_ADAPT_MAX), 1 and 10 by default,
+    the lower first."""
+    lo, hi = doll_level(kv.get("DOLL_ADAPT_MIN"), 1), doll_level(kv.get("DOLL_ADAPT_MAX"), 10)
+    return min(lo, hi), max(lo, hi)
+
+
+def level_arg(v, key):
+    """(v141 beta 6) A level asked for (doll-set's JSON: a number or its text): 1 to 10, else refused."""
+    if isinstance(v, int) and not isinstance(v, bool) and 1 <= v <= len(DOLL_TIERS):
+        return v
+    if isinstance(v, str) and v.strip() in DOLL_LEVELS:
+        return int(v)
+    raise Fail("%s: 1 to %d" % (key, len(DOLL_TIERS)), "usage", "%s 1-%d" % (key, len(DOLL_TIERS)))
+
+
+def follow_level(n, kv=None):
+    """(v150-host beta 16) The difficulty of a doll that follows its bot's virtual dolls (DOLL_DIFFICULTY=vdoll): (its level,
+    the bot's VDOLL_LEVEL as its game takes it). The k-th of the bot's dolls set to play (DOLL_ENABLED=1), in their numbers'
+    order, takes the k-th level of the list, the last for the rest; no VDOLL_LEVEL: 5 (mgo1doll-manager's follow_levels, which
+    writes it for the doll's start)."""
+    kv = kv if kv is not None else read_kv(doll_env(n))
+    try:
+        b = int(kv.get("DOLL_BOT", "1"))
+    except ValueError:
+        b = 1
+    levels = vdoll_level_of(read_kv(bot_env(b)).get("VDOLL_LEVEL"))
+    lv = levels.split(",")
+    k = len([x for x in dolls() if x < n and doll_bot(x) == b and read_kv(doll_env(x)).get("DOLL_ENABLED", "1") == "1"])
+    return int(lv[min(k, len(lv) - 1)]), levels
+
+
+def follows(kv):
+    return kv.get("DOLL_DIFFICULTY") == "vdoll"
+
+
+def difficulty_orders(n, kv, was_following=False):
+    """The live orders of a doll's difficulty as its settings have it: its number; one that follows its bot's virtual dolls,
+    their level and the live level off; one that followed them and no longer does, its own live level again (DOLL_ADAPT)."""
+    if follows(kv):
+        doll_order(n, "difficulty %d" % follow_level(n, kv)[0])
+        doll_order(n, "adapt off")
+    else:
+        doll_order(n, "difficulty %d" % doll_level(kv.get("DOLL_DIFFICULTY"), 3))
+        if was_following:
+            doll_order(n, "adapt %s" % ("off" if kv.get("DOLL_ADAPT", "1") == "0" else "on"))
+
+
+def follow_sync(b):
+    """The running dolls of bot b that follow its virtual dolls' level told it again (the bot's VDOLL_LEVEL changed, or a
+    doll before them was added, removed, turned on or off: their place in the list)."""
+    for n in dolls():
+        kv = read_kv(doll_env(n))
+        if doll_bot(n) == b and follows(kv):
+            code, state, _ = systemctl("is-active", "mgo1doll@%d" % n)
+            if (state.strip() or ("active" if code == 0 else "")) in ("active", "activating"):
+                difficulty_orders(n, kv)
+
+
+def doll_summary(n):
+    kv = read_kv(doll_env(n))
+    acc = kv.get("DOLL_ACCOUNT_ID", "")
+    st = {}
+    try:
+        with open(os.path.join(doll_state(n), "status.json")) as f:
+            st = json.load(f)
+    except (OSError, ValueError):
+        pass
+    code, state, _ = systemctl("is-active", "mgo1doll@%d" % n)
+    state = state.strip() or ("active" if code == 0 else "inactive")
+    age = -1
+    try:
+        age = int(time.time() - os.path.getmtime(os.path.join(doll_state(n), "status.json")))
+    except OSError:
+        pass
+    def num(k, d):
+        try:
+            return int(kv.get(k, d))
+        except ValueError:
+            return int(d)
+    # the players of its bot's game (the orders "follow" / "target" pick one of them)
+    names = []
+    try:
+        with open(os.path.join(STATE_ROOT, "bot%d" % num("DOLL_BOT", 1), "run", "status.json")) as f:
+            names = [p.get("name", "") for p in json.load(f).get("players", []) if not p.get("host") and p.get("name")]
+    except (OSError, ValueError, AttributeError):
+        pass
+    # its player name: an accountless doll's is its DOLL_NAME, else DOLL_<n> (docs/PLAYABLE_DOLL.md 1); another's what
+    # its status says once it knows which player it is
+    name = st.get("name", "") if acc else doll_name(n, kv)
+    # (v141 beta 6) its difficulty and live level's bounds as mgo1doll.sh gives them to the game, the difficulty's tier;
+    # (v150-host beta 16) one that follows its bot's virtual dolls (DOLL_DIFFICULTY=vdoll): their level, "difficulty_from"
+    # "vdoll" ("set": its own number), its live level off whatever DOLL_ADAPT says ("adapt" false)
+    diff = follow_level(n, kv)[0] if follows(kv) else doll_level(kv.get("DOLL_DIFFICULTY"), 3)
+    lo, hi = doll_bounds(kv)
+    return {"doll": n, "account": (acc[:1] + "***") if acc else "", "has_account": bool(acc), "accountless": not acc,
+            "name": name, "name_set": bool(not acc and kv.get("DOLL_NAME")), "identity": st.get("identity", ""),
+            "bot": num("DOLL_BOT", 1), "players": names,
+            "difficulty": diff, "tier": DOLL_TIERS[diff - 1], "difficulty_from": "vdoll" if follows(kv) else "set",
+            "adapt_min": lo, "adapt_max": hi,
+            "team": kv.get("DOLL_TEAM", "auto"), "enabled": kv.get("DOLL_ENABLED", "1") == "1",
+            "loadout": kv.get("DOLL_LOADOUT", "auto"), "order": kv.get("DOLL_ORDER", "free"),
+            "adapt": kv.get("DOLL_ADAPT", "1") != "0" and not follows(kv), "aim": doll_aim_of(kv),
+            "running": state in ("active", "activating"), "state": state, "age": age,
+            "status": redact_event(st, secrets()) if st else {}}
+
+
+def doll_name(n, kv=None):
+    """(v141 beta 5) An accountless doll's name in the game: its DOLL_NAME when valid, else DOLL_<n>."""
+    v = (kv if kv is not None else read_kv(doll_env(n))).get("DOLL_NAME", "")
+    return v if DOLL_NAME_RE.match(v) and "  " not in v else "DOLL_%d" % n
+
+
+def check_doll_name(name, n):
+    """(v141 beta 5) A name asked for doll n (0: a doll to be added): valid and no other doll's (whatever the case). The
+    game shows it as typed; a real player of the same name would be taken for a doll by the dolls."""
+    if not DOLL_NAME_RE.match(name) or "  " in name:
+        raise Fail("a doll's name: 3 to 15 letters, digits, spaces and . _ - ! ? + *", "doll_name", name)
+    if DOLL_DEFAULT_RE.match(name):
+        raise Fail("DOLL_<number> names are the dolls' own", "doll_name_default", name)
+    for o in dolls():
+        if o == n:
+            continue
+        kv = read_kv(doll_env(o))
+        other = doll_name(o, kv) if not kv.get("DOLL_ACCOUNT_ID") else ""
+        if not other:
+            try:
+                with open(os.path.join(doll_state(o), "status.json")) as f:
+                    other = json.load(f).get("name", "")
+            except (OSError, ValueError, AttributeError):
+                other = ""
+        if other and other.upper() == name.upper():
+            raise Fail("doll %d has this name" % o, "doll_name_taken", o)
+
+
+def gate_on():
+    """The accountless dolls (host/mgo1-dollgate on 127.0.0.1, one a bot), unless server.env says DOLL_GATE=0."""
+    return read_kv(SERVER_ENV).get("DOLL_GATE", "1") != "0"
+
+
+def doll_bot(n):
+    try:
+        return int(read_kv(doll_env(n)).get("DOLL_BOT", "1"))
+    except ValueError:
+        return 1
+
+
+def usable_cores():
+    """(v141 beta 12) The cores the games may use: three quarters of them, less the share the VPS's machine has taken since
+    the server started (/proc/stat's steal), as mgo1doll-manager counts them."""
+    steal = 0.0
+    try:
+        with open("/proc/stat") as f:
+            v = [int(x) for x in f.readline().split()[1:]]
+        if len(v) > 7 and sum(v[:8]):
+            steal = min(0.8, v[7] / sum(v[:8]))
+    except (OSError, ValueError):
+        pass
+    return (os.cpu_count() or 1) * (1.0 - steal) * 0.75
+
+
+def doll_capacity():
+    """The dolls this server can run at once besides its bots: a doll is a whole game too. (v141 beta 12) measured 0.32 of
+    a core at the game's full pace and 140 MB, counted 0.4 and 250 MB; a bot 0.35 and 350 MB; the usable cores
+    (mgo1doll-manager keeps to it, its pace guard takes the dolls a slower server cannot keep at the game's pace)."""
+    mem = 0
+    try:
+        for line in open("/proc/meminfo"):
+            if line.startswith("MemTotal:"):
+                mem = int(line.split()[1]) // 1024
+    except OSError:
+        pass
+    n = len(bots())
+    cores, left = usable_cores() - 0.35 * n, mem - 400 - 350 * n     # what the bots leave
+    return max(0, min(MAX_DOLLS, int(cores / 0.4), int(left / 250)))
+
+
+def doll_list():
+    """(v141 beta 3) server.env's DOLL_LIST: host (the default), own or off."""
+    v = read_kv(SERVER_ENV).get("DOLL_LIST", "host")
+    return v if v in ("off", "own", "host") else "host"
+
+
+def host_unranked():
+    """(v141 beta 7) server.env's HOST_UNRANKED: auto (the default), always or off (mgo1host.sh takes another value as auto)."""
+    v = read_kv(SERVER_ENV).get("HOST_UNRANKED", "auto")
+    return v if v in ("auto", "always", "off") else "auto"
+
+
+# ---- (v150-host beta 16) why a bot's playable dolls do not start: mgo1doll-manager's own sums, counted here too ----
+# the states of a unit that has, or is about to have, a game (mgo1doll-manager's RUNNING)
+RUNNING = ("active", "activating", "reloading", "deactivating", "unknown")
+SUMS_KEYS = ("seats", "real", "vdolls", "kept", "free_for_dolls", "dolls_set", "dolls_in", "pace_cap", "pace_wait_s")
+
+
+def doll_sums(bot, exists, unit, state, most, real, vset, keep_seat, dolls_set, no_gate, budget, capacity, cap, cap_wait, dolls_in):
+    """(v150-host beta 16) One bot's playable dolls: how many may play now (want) and, when fewer than those set, why: a code
+    (bot_stopped, not_hosting, seats, server_full, pace_guard, gate_off), its words for the daily log and their level (W: a
+    setting the owner must change). exists: the bot's settings file is there; unit: its service's state; state: its
+    status's; most: its game's players, the host one of them; real: the real players in it; vset: its virtual dolls wanted
+    (its status's vdolls_set); dolls_set: its dolls with DOLL_ENABLED=1, no_gate of them accountless while DOLL_GATE=0;
+    budget: the dolls the server can still run, capacity: in all; cap, cap_wait: the pace guard's most for the bot (None:
+    none) and the seconds before one more at the soonest; dolls_in: its dolls in its game now.
+    The same sum as mgo1doll-manager's doll_sums, which decides (the agent cannot load it: a copy; tests/test_doll_manager.py
+    part 24 gives both the same folders and compares)."""
+    seats = max(0, most - 1)                              # the dedicated host takes one
+    kept = 1 if keep_seat else 0
+    vres = max(0, min(vset, seats - kept))                # its virtual dolls hold their seats (docs/VIRTUAL_DOLL.md 6)
+    hosting = exists and unit == 'active' and state == 'hosting'
+    if not hosting:
+        real = dolls_in = 0
+    free = max(0, seats - real - vres - kept)
+    can = dolls_set - no_gate
+    want = min(can, free, budget) if hosting else 0
+    if cap is not None:
+        want = min(want, cap)
+    want = max(0, want)
+    code, why, level, sig = '', '', 'I', None
+    if dolls_set and want < dolls_set:
+        s = '' if dolls_set == 1 else 's'
+        wait = "bot %d's playable doll%s (%d) wait%s: " % (bot, s, dolls_set, 's' if dolls_set == 1 else '')
+        some = 'bot %d: %d playable doll%s set, %s can start: ' % (bot, dolls_set, s, 'only %d' % want if want else 'none')
+        head = some if want else wait
+        fit = max(0, seats - vres - kept)                 # the most that ever play, with no real player in
+        if can == 0:                                      # (none of them may play, whatever its bot does)
+            code, level = 'gate_off', 'W'
+            why = wait + 'no account, and DOLL_GATE=0 in server.env (no accountless doll on this server)'
+        elif not exists:
+            code, level, sig = 'bot_stopped', 'W', (False, '')
+            why = wait + 'there is no bot %d on this server (their DOLL_BOT: remove them, or give them another bot)' % bot
+        elif unit not in RUNNING or unit == 'deactivating':
+            code, level, sig = 'bot_stopped', 'W', (True, unit)
+            why = wait + 'bot %d is not running (its service is %s)' % (bot, unit)
+        elif not hosting:
+            code = 'not_hosting'
+            why = wait + 'its game is not hosting yet (%s)' % ('its service is %s' % unit if unit != 'active' else
+                                                                'state %s' % state if state else 'no status yet')
+        elif want == free:
+            code, sig = 'seats', (seats, vres, kept, fit < can)
+            why = some + 'its game has %d seat%s (max_players %d)%s%s%s' % (
+                seats, '' if seats == 1 else 's', most, ', %d for its virtual dolls' % vres if vres else '',
+                ', 1 kept for a real player' if kept else '', ', %d real player%s' % (real, '' if real == 1 else 's') if real else '')
+            if fit < can:                                 # (its settings alone: never all of them, whoever plays)
+                level = 'W'
+                why += '; %s whatever the players (more max_players or fewer virtual dolls)' % (
+                    'only %d of them can ever play' % fit if fit else 'none of them can ever play')
+        elif want == budget:
+            code, level = 'server_full', 'W' if capacity <= 0 else 'I'
+            why = head + 'the server can run %d %sdoll%s now (%d in all besides its bots and their virtual dolls)' % (
+                budget, 'more ' if capacity > budget else '', '' if budget == 1 else 's', capacity)
+        elif cap is not None and want == cap:
+            code = 'pace_guard'
+            why = head + 'the pace guard allows %d%s (its game ran below its pace; DOLL_PACE_GUARD=0 in server.env: no guard)' % (
+                cap, ' for %d more minute%s at least' % ((cap_wait + 59) // 60, '' if (cap_wait + 59) // 60 == 1 else 's') if cap_wait > 0 else '')
+        else:
+            code, level = 'gate_off', 'W'
+            why = some + '%d of them have no account, and DOLL_GATE=0 in server.env' % no_gate
+    return {'want': want, 'code': code, 'why': why, 'level': level, 'sig': (code, want == 0, dolls_set, sig) if code else None,
+            'seats': seats, 'real': real, 'vdolls': vres, 'kept': kept, 'free_for_dolls': free, 'dolls_set': dolls_set,
+            'dolls_in': dolls_in, 'pace_cap': cap, 'pace_wait_s': int(cap_wait) if cap is not None else 0}
+
+
+def doll_budget(active_bots, vdolls):
+    """The dolls the server can run now besides its running bots and their virtual dolls, as mgo1doll-manager counts them (its
+    capacity(): a bot 0.35 of a core and 350 MB, a doll 0.4 and 250 MB, a virtual doll 0.03 of a core, a quarter of the cores
+    left free, the VPS's steal since the server's start taken off)."""
+    mem = int(os.environ.get("MGO1_MEM_MB", "0"))        # (tests: the machine's memory and cores given, as the manager's)
+    try:
+        for line in open("/proc/meminfo") if not mem else ():
+            if line.startswith("MemTotal:"):
+                mem = int(line.split()[1]) // 1024
+    except OSError:
+        pass
+    steal = 0.0
+    try:
+        with open(os.environ.get("MGO1_PROC_STAT", "/proc/stat")) as f:
+            v = [int(x) for x in f.readline().split()[1:]]
+        steal = 100.0 * v[7] / sum(v[:8]) if len(v) > 7 and sum(v[:8]) else 0.0
+    except (OSError, ValueError, IndexError):
+        pass
+    cores = (int(os.environ.get("MGO1_CORES", "0")) or os.cpu_count() or 1) * (1.0 - min(80.0, steal) / 100.0)
+    cores, left = cores * 0.75 - 0.35 * active_bots - 0.03 * vdolls, mem - 400 - 350 * active_bots
+    return max(0, min(MAX_DOLLS, int(cores / 0.4), int(left / 250)))
+
+
+def json_file(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            v = json.load(f)
+        return v if isinstance(v, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def dolls_waiting():
+    """(budget, {bot: its sums}): for each bot, and each bot dolls are set for, what mgo1doll-manager counts for its playable
+    dolls each round (its main loop: the bots in their order share the server's budget): the seats, the real players, the
+    virtual dolls' seats, the dolls that may play and, when fewer than those set, why (doll_sums)."""
+    senv = read_kv(SERVER_ENV)
+    gate = senv.get("DOLL_GATE", "1") != "0"
+    keep_seat = senv.get("DOLL_KEEP_SEAT", "1") != "0" or (gate and senv.get("DOLL_LIST", "host") != "off")
+    guarded = senv.get("DOLL_PACE_GUARD", "1") != "0"
+    ds, names = [], set()
+    for n in dolls():
+        kv = read_kv(doll_env(n))
+        acc = bool(kv.get("DOLL_ACCOUNT_ID"))
+        if acc:                                            # (its name once it knows who it is, else the last one known)
+            st = json_file(os.path.join(doll_state(n), "status.json"))
+            nm = st.get("name") or ""
+            if not nm or st.get("identity", "name") == "unknown":
+                try:
+                    with open(os.path.join(doll_state(n), "name")) as f:
+                        nm = f.read().strip()
+                except OSError:
+                    nm = ""
+        else:
+            nm = doll_name(n, kv)
+        on = kv.get("DOLL_ENABLED", "1") == "1"
+        ds.append({"n": n, "bot": doll_bot(n), "account": acc, "on": on, "enabled": on and (acc or gate), "name": str(nm).upper()})
+        if nm:
+            names.add(str(nm).upper())
+
+    def unit_state(b):
+        rc, so, _ = systemctl("is-active", "mgo1host@%d" % b)
+        return so.strip() or ("unknown" if rc == 127 else "active" if rc == 0 else "inactive")
+    have = bots()
+    asked = sorted(set(have) | {d["bot"] for d in ds if 1 <= d["bot"] <= MAX_BOTS})
+    lines = systemctl("is-active", *["mgo1host@%d" % b for b in asked])[1].split() if asked else []   # (one call, as the manager's)
+    units = dict(zip(asked, lines)) if len(lines) == len(asked) else {b: unit_state(b) for b in asked}
+    status = {b: json_file(os.path.join(bot_state(b), "run", "status.json")) for b in units}
+
+    def vset(st):
+        try:
+            return max(0, int(st.get("vdolls_set", 0) or 0))
+        except (TypeError, ValueError):
+            return 0
+    on_bots = [b for b in have if units.get(b, "unknown") in RUNNING]
+    total = budget = doll_budget(len(on_bots), sum(vset(status[b]) for b in on_bots))
+    pace = json_file(os.path.join(STATE_ROOT, "pace_guard.json")) if guarded else {}
+    now, res = time.time(), {}
+    for b in sorted(set(have) | {d["bot"] for d in ds}):  # (a bot with no doll too: its seats, what is free for dolls)
+        mine = [d for d in ds if d["bot"] == b]
+        st = status.get(b) or {}
+        players = [p for p in st.get("players", []) if isinstance(p, dict) and not p.get("host")]
+        game = st.get("game") or {}
+        try:
+            most = int(game.get("max") or read_kv(bot_game(b)).get("max_players", 9))
+        except ValueError:
+            most = 9
+        in_game = {str(p.get("name", "")).upper() for p in players if not p.get("vdoll")}
+        numbers = {p.get("doll") for p in players if p.get("doll")}
+        kinds = bool(players) and all("kind" in p for p in players)
+        real = [p for p in players if p.get("kind") == "real"] if kinds else [p for p in players if str(p.get("name", "")).upper() not in names]
+        found = [d for d in mine if d["enabled"] and ((not d["account"] and d["n"] in numbers) or (d["name"] and d["name"] in in_game))]
+        g = pace.get(str(b)) if isinstance(pace.get(str(b)), dict) else {}
+        cap, wait = g.get("cap"), 0
+        if cap is not None:
+            try:
+                hold = float(g.get("hold") or 0)
+                wait = int(max(0.0, hold - (now - float(g.get("at") or 0)), hold - (now - float(g["ok_since"])) if g.get("ok_since") else hold))
+            except (TypeError, ValueError):
+                wait = 0
+        keep_here = keep_seat or (senv.get("DOLL_LIST", "host") != "off" and vset(st) > 0)   # (the game's rule for its virtual dolls)
+        sums = doll_sums(b, b in have, units.get(b, "unknown"), str(st.get("state") or ""), most, len(real), vset(st), keep_here,
+                         len([d for d in mine if d["on"]]), len([d for d in mine if d["on"] and not d["enabled"]]), budget, total,
+                         cap, wait, len(found))
+        budget -= sums["want"]
+        res[b] = dict({"waiting_code": sums["code"], "waiting_why": sums["why"]}, **{k: sums[k] for k in SUMS_KEYS})
+    return total, res
+
+
+def cmd_dolls():
+    ds = [doll_summary(n) for n in dolls()]
+    # each bot's accountless dolls: how many it has, its DOLL_COUNT (null when not set); (v150-host beta 16) and for a bot
+    # that has playable dolls, what mgo1doll-manager counts for them: waiting_code ("": they can start; bot_stopped,
+    # not_hosting, seats, server_full, pace_guard, gate_off) and waiting_why (its words, the manager's log line), seats (its
+    # game's, the host not counted), real (players), vdolls (seats held for its virtual dolls), kept (0 or 1),
+    # free_for_dolls, dolls_set (with DOLL_ENABLED=1), dolls_in (in its game now), pace_cap (null: none), pace_wait_s. A bot
+    # that is not there and has dolls (their DOLL_BOT) is listed too ("exists": false)
+    budget, waiting = dolls_waiting()
+    none = dict({"waiting_code": "", "waiting_why": ""}, **{k: None if k == "pace_cap" else 0 for k in SUMS_KEYS})
+    counts = {}
+    for b in sorted(set(bots()) | set(waiting)):
+        there = b in bots()
+        v = read_kv(bot_env(b)).get("DOLL_COUNT", "")
+        counts[str(b)] = {"accountless": len([d for d in ds if d["bot"] == b and d["accountless"]]),
+                          "with_account": len([d for d in ds if d["bot"] == b and not d["accountless"]]),
+                          "doll_count": int(v) if v.isdigit() else None, "most": accountless_most(b) if there else 0, "exists": there}
+        counts[str(b)].update(waiting.get(b, none))
+    rc, so, _ = systemctl("is-active", "mgo1doll-manager")
+    return {"ok": True, "dolls": ds, "max": MAX_DOLLS, "capacity": doll_capacity(), "accountless": gate_on(), "bots": counts,
+            "keep_seat": read_kv(SERVER_ENV).get("DOLL_KEEP_SEAT", "1") != "0",
+            "list": doll_list(), "names": True, "unranked": host_unranked(),
+            "budget": budget, "manager": so.strip() or ("active" if rc == 0 else "inactive"),
+            # (v150-host beta 16) this server takes the difficulty "vdoll" (doll-set, doll-order, doll-all; DOLL_DIFFICULTY=vdoll):
+            # MGO1 Host offers AS THE VIRTUAL DOLLS on a server with no doll yet only when it sees this
+            "vdoll_difficulty": True,
+            # (v150-host beta 18) this server takes a doll's "aim" (doll-set, doll-order, doll-all; DOLL_AIM): MGO1 Host shows AIM
+            # only when it sees this
+            "doll_aim": True}
+
+
+def game_max_players(b):
+    """A bot's game's max_players (its settings file; 9 when it has none: 8 players and the host)."""
+    try:
+        for line in open(os.path.join(CONF, "bot%d.game" % b), encoding="utf-8", errors="replace"):
+            m = re.match(r"\s*max_players\s*=\s*(\d+)", line)
+            if m:
+                return max(2, min(16, int(m.group(1))))
+    except OSError:
+        pass
+    return 9
+
+
+def accountless_most(b):
+    """The most accountless dolls bot b's game takes: its max_players less the host (Host Only) and its dolls with an
+    account, within the server's MAX_DOLLS (the other bots' dolls counted)."""
+    ds = dolls()
+    mine = len([x for x in ds if doll_bot(x) == b and not read_kv(doll_env(x)).get("DOLL_ACCOUNT_ID")])
+    others = len([x for x in ds if doll_bot(x) == b and read_kv(doll_env(x)).get("DOLL_ACCOUNT_ID")])
+    return max(0, min(MAX_DOLLS - len(ds) + mine, game_max_players(b) - 1 - others))
+
+
+def cmd_doll_count(args):
+    """doll-count <bot> <n>: the bot's accountless dolls (DOLL_<N>, no account): its DOLL_COUNT, applied at once.
+    (v141 beta 5) {"name": ...} on stdin: the name in the game of the doll it adds (its DOLL_NAME)."""
+    if len(args) != 2 or not args[0].isdigit() or not args[1].isdigit():
+        raise Fail("doll-count <bot> <n>", "usage", "doll-count <bot> <n>")
+    b, n = int(args[0]), int(args[1])
+    name = ""
+    if not sys.stdin.isatty():
+        try:
+            d = json.loads(sys.stdin.read() or "{}")
+        except ValueError:
+            raise Fail("the settings are not JSON", "bad_json")
+        name = str(d.get("name") or "").strip() if isinstance(d, dict) else ""
+    if name:
+        check_doll_name(name, 0)
+    if b not in bots():
+        raise Fail("no bot %d on this server" % b, "no_bot", b, ", ".join(map(str, bots())) or "-")
+    if not gate_on():
+        raise Fail("no accountless doll on this server (DOLL_GATE=0 in server.env)", "dolls_no_gate")
+    room = accountless_most(b)
+    if n > room:
+        raise Fail("bot %d: %d dolls at most (its game's players and the server's %d dolls)" % (b, room, MAX_DOLLS), "dolls_full", b, room)
+    with dolls_lock():
+        set_env_keys({"DOLL_COUNT": str(n)}, bot_env(b))
+    # the dolls added or removed now (the manager would do it within seconds): its own code, under its lock
+    mgr = os.environ.get("MGO1_DOLL_MANAGER", "/usr/local/bin/mgo1doll-manager")
+    env = dict(os.environ, MGO1_ETC=CONF, MGO1_VAR=STATE_ROOT, MGO1_SYSTEMCTL=tool("systemctl"), MGO1_LOG_DIR=LOG_ROOT)
+    if name:                                              # (the manager writes it into the doll it adds, under its lock)
+        env.update(MGO1_DOLL_NEW_NAME=name, MGO1_DOLL_NEW_BOT=str(b))
+    try:
+        subprocess.run([sys.executable, mgr, "--counts"], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    follow_sync(b)
+    return cmd_dolls()
+
+
+def cmd_doll_set(args):
+    """A doll's settings: JSON on stdin {"id", "password", "bot", "difficulty", "adapt_min", "adapt_max", "team",
+    "enabled"}; the account kept when id / password are left out. A doll with no account is accountless (DOLL_<n>, its
+    bot's doll lobby); with DOLL_GATE=0 in server.env a new doll needs its account."""
+    n = doll_number(args)
+    try:
+        d = json.loads(sys.stdin.read() or "{}")
+    except ValueError:
+        raise Fail("the settings are not JSON", "bad_json")
+    kv = read_kv(doll_env(n))
+    was = (follows(kv), kv.get("DOLL_BOT"), kv.get("DOLL_ENABLED", "1"))
+    if "id" in d or "password" in d:
+        aid, apw = str(d.get("id", "")).strip(), str(d.get("password", "")).strip()
+        if not (3 <= len(aid) <= 15 and NAME_RE.match(aid)):
+            raise Fail("the account ID: 3 to 15 letters, digits, - _ .", "account_id")
+        if not (6 <= len(apw) <= 15 and NAME_RE.match(apw)):
+            raise Fail("the password: 6 to 15 letters, digits, - _ .", "account_pw")
+        for b in bots():                                  # never a bot's account: they would log each other out
+            if read_kv(bot_env(b)).get("HOST_ACCOUNT_ID", "").upper() == aid.upper():
+                raise Fail("this account is bot %d's" % b, "doll_account_bot", b)
+        for o in dolls():
+            if o != n and read_kv(doll_env(o)).get("DOLL_ACCOUNT_ID", "").upper() == aid.upper():
+                raise Fail("this account is doll %d's" % o, "doll_account_doll", o)
+        kv["DOLL_ACCOUNT_ID"], kv["DOLL_ACCOUNT_PASSWORD"] = aid.upper(), apw.upper()
+    if not kv.get("DOLL_ACCOUNT_ID") and not gate_on():
+        raise Fail("a new doll needs its account", "doll_no_account", n)
+    # (v141 beta 5) an accountless doll's name in the game ("" or DOLL_<n>: its own again); a doll with an account
+    # plays under its account's name
+    before = doll_name(n, kv) if not kv.get("DOLL_ACCOUNT_ID") else ""
+    if "name" in d:
+        nm = str(d.get("name") or "").strip()
+        if nm.upper() == "DOLL_%d" % n:
+            nm = ""
+        if nm and kv.get("DOLL_ACCOUNT_ID"):
+            raise Fail("a doll with an account plays under its account's name", "doll_name_account", n)
+        if nm:
+            check_doll_name(nm, n)
+            kv["DOLL_NAME"] = nm
+        else:
+            kv.pop("DOLL_NAME", None)
+    if kv.get("DOLL_ACCOUNT_ID"):
+        kv.pop("DOLL_NAME", None)
+    if "bot" in d:
+        b = int(d["bot"])
+        if b not in bots():
+            raise Fail("no bot %d on this server" % b, "no_bot", b, ", ".join(map(str, bots())) or "-")
+        kv["DOLL_BOT"] = str(b)
+    if "difficulty" in d:                                 # (v150-host beta 16) "vdoll": its bot's virtual dolls' level
+        kv["DOLL_DIFFICULTY"] = "vdoll" if d["difficulty"] == "vdoll" else str(level_arg(d["difficulty"], "difficulty"))
+    if "adapt_min" in d or "adapt_max" in d:
+        amin, amax = doll_bounds(kv)                      # (v141 beta 6) the bound not given kept; the lower first
+        amin = level_arg(d["adapt_min"], "adapt_min") if "adapt_min" in d else amin
+        amax = level_arg(d["adapt_max"], "adapt_max") if "adapt_max" in d else amax
+        kv["DOLL_ADAPT_MIN"], kv["DOLL_ADAPT_MAX"] = str(min(amin, amax)), str(max(amin, amax))
+    if "team" in d:
+        if d["team"] not in DOLL_TEAMS:
+            raise Fail("team: auto, red, blue or spectator", "usage", "team auto|red|blue|spectator")
+        kv["DOLL_TEAM"] = d["team"]
+    if "enabled" in d:
+        kv["DOLL_ENABLED"] = "1" if d["enabled"] else "0"
+    if "adapt" in d:
+        kv["DOLL_ADAPT"] = "1" if d["adapt"] else "0"
+    if "loadout" in d:
+        lo = str(d["loadout"]).strip().lower()
+        prim, _, sec = lo.partition(",")
+        if prim not in DOLL_LOADOUTS or sec not in ("", "m1911", "mk22"):
+            raise Fail("loadout: auto or a primary (scorpion xm16 ak47 m37 svd mosin)[,m1911|mk22]", "usage", "loadout")
+        kv["DOLL_LOADOUT"] = lo
+    if "aim" in d:                                        # (v150-host beta 18) direct or pad
+        kv["DOLL_AIM"] = doll_aim_arg(d["aim"])
+    kv.setdefault("DOLL_BOT", str(bots()[0] if bots() else 1))
+    kv.setdefault("DOLL_TEAM", "auto"); kv.setdefault("DOLL_ENABLED", "1")
+    # (v141 beta 6) the levels written as the doll takes them: 1 to 10 (or vdoll), else their defaults
+    kv["DOLL_DIFFICULTY"] = "vdoll" if follows(kv) else str(doll_level(kv.get("DOLL_DIFFICULTY"), 3))
+    amin, amax = doll_bounds(kv)
+    kv["DOLL_ADAPT_MIN"], kv["DOLL_ADAPT_MAX"] = str(amin), str(amax)
+    text = "# PLAYABLE DOLL %d (MGO1 Host.exe, mgo1host-agent doll-set)\n" % n
+    for k in DOLL_KEYS:
+        if k in kv:
+            text += "%s=%s\n" % (k, kv[k])
+    with dolls_lock():
+        write_atomic(doll_env(n), text, 0o600)
+        sync_counts()
+    try:
+        os.close(dir_fd(doll_state(n), make=True))
+    except OSError:
+        pass
+    # live: the difficulty, the team and the weapons go to the running doll at once ((v141 beta 6) the live level and its
+    # bounds too when given)
+    difficulty_orders(n, kv, was[0])
+    doll_order(n, "team %s" % kv["DOLL_TEAM"])
+    if "adapt" in d and not follows(kv):                  # (one that follows the virtual dolls: off, its own kept for later)
+        doll_order(n, "adapt %s" % ("on" if kv["DOLL_ADAPT"] == "1" else "off"))
+    if "adapt_min" in d or "adapt_max" in d:
+        doll_order(n, "adapt_min %s" % kv["DOLL_ADAPT_MIN"])
+        doll_order(n, "adapt_max %s" % kv["DOLL_ADAPT_MAX"])
+    if "loadout" in d:
+        doll_order(n, "loadout %s" % kv["DOLL_LOADOUT"])
+    if "aim" in d:
+        doll_order(n, "aim %s" % kv["DOLL_AIM"])
+    if "id" in d or ("enabled" in d and not d["enabled"]):
+        systemctl("stop", "mgo1doll@%d" % n)               # a new account logs in again (the manager starts it)
+    elif not kv.get("DOLL_ACCOUNT_ID") and doll_name(n, kv) != before:
+        # renamed: a running doll leaves the game now (its order) and the manager starts it again, its log-in with the name
+        code, state, _ = systemctl("is-active", "mgo1doll@%d" % n)
+        if (state.strip() or ("active" if code == 0 else "")) in ("active", "activating"):
+            doll_order(n, "leave")
+        note("admin", do="doll-rename", doll=n, a=doll_name(n, kv))
+    if (kv.get("DOLL_BOT"), kv.get("DOLL_ENABLED", "1")) != was[1:]:   # (its bots' other dolls that follow: their places)
+        for b in {doll_bot(n)} | ({int(was[1])} if str(was[1] or "").isdigit() else set()):
+            follow_sync(b)
+    return {"ok": True, "doll": doll_summary(n)}
+
+
+def cmd_doll_remove(args):
+    n = doll_number(args)
+    b = doll_bot(n)
+    systemctl("stop", "mgo1doll@%d" % n)
+    with dolls_lock():
+        try:
+            os.remove(doll_env(n))
+        except OSError:
+            pass
+        sync_counts()                                     # (an accountless one: its bot's DOLL_COUNT one less)
+    shutil.rmtree(doll_state(n), ignore_errors=True)
+    follow_sync(b)
+    return {"ok": True, "dolls": [doll_summary(x) for x in dolls()]}
+
+
+class dolls_lock:
+    """The lock mgo1doll-manager takes while it adds or removes dolls (a bot's DOLL_COUNT)."""
+    def __enter__(self):
+        import fcntl
+        try:
+            self.f = open(os.path.join(CONF, ".dolls.lock"), "a")
+            fcntl.flock(self.f, fcntl.LOCK_EX)
+        except OSError:
+            self.f = None
+        return self
+
+    def __exit__(self, *a):
+        if self.f:
+            self.f.close()
+
+
+def sync_counts():
+    """Each bot's DOLL_COUNT, when set, kept to the accountless dolls it has after a doll set or removed by hand."""
+    for b in bots():
+        v = read_kv(bot_env(b)).get("DOLL_COUNT", "")
+        if not v.isdigit():
+            continue
+        k = len([x for x in dolls() if doll_bot(x) == b and not read_kv(doll_env(x)).get("DOLL_ACCOUNT_ID")])
+        if k != int(v):
+            set_env_keys({"DOLL_COUNT": str(k)}, bot_env(b))
+
+
+def set_doll_keys(n, keys):
+    """Some keys of a doll's settings changed in its env file (kept for its next start)."""
+    kv = read_kv(doll_env(n))
+    if not kv:
+        return
+    kv.update(keys)
+    text = "# PLAYABLE DOLL %d (MGO1 Host.exe, mgo1host-agent doll-set)\n" % n
+    for k in DOLL_KEYS:
+        if k in kv:
+            text += "%s=%s\n" % (k, kv[k])
+    write_atomic(doll_env(n), text, 0o600)
+
+
+def doll_order(n, line):
+    """An order in the doll's command file (appended; the doll reads and clears it)."""
+    try:                                                   # (the doll's folder is the game's user's: never through a link)
+        safe_write(os.path.join(doll_state(n), "command"), line + "\n", append=True, owner=True, make=True)
+    except OSError as e:
+        raise Fail("doll %d's command file cannot be written (%s)" % (n, e.strerror or e), "unsafe_file", n)
+
+
+def cmd_doll_order(args):
+    """doll-order <n> difficulty <1-10|vdoll> | team <auto|red|blue|spectator> | order <free|objective|hide|defend|follow>
+    | order target <player name> | adapt <on|off> | adapt_min <1-10> | adapt_max <1-10> | aim <direct|pad> | leave"""
+    n = doll_number(args)
+    rest = args[1:]
+    if not rest:
+        raise Fail("an order", "usage", cmd_doll_order.__doc__.split("\n")[0])
+    k = rest[0]
+    was = follows(read_kv(doll_env(n)))
+    if k == "difficulty" and len(rest) == 2 and (rest[1] in DOLL_LEVELS or rest[1] == "vdoll"):
+        # (v150-host beta 16) vdoll: its bot's virtual dolls' level, the live level off (the number and `adapt off` sent)
+        set_doll_keys(n, {"DOLL_DIFFICULTY": rest[1]})
+        difficulty_orders(n, read_kv(doll_env(n)) or {"DOLL_DIFFICULTY": rest[1]}, was)
+    elif k in ("adapt_min", "adapt_max") and len(rest) == 2 and rest[1] in DOLL_LEVELS:
+        # (v141 beta 6) the live level's bounds: the other one kept, swapped when the wrong way round, both sent
+        lo, hi = doll_bounds(read_kv(doll_env(n)))
+        lo, hi = (int(rest[1]), hi) if k == "adapt_min" else (lo, int(rest[1]))
+        lo, hi = min(lo, hi), max(lo, hi)
+        doll_order(n, "adapt_min %d" % lo)
+        doll_order(n, "adapt_max %d" % hi)
+        set_doll_keys(n, {"DOLL_ADAPT_MIN": str(lo), "DOLL_ADAPT_MAX": str(hi)})
+    elif k == "team" and len(rest) == 2 and rest[1] in DOLL_TEAMS:
+        doll_order(n, "team %s" % rest[1])
+        set_doll_keys(n, {"DOLL_TEAM": rest[1]})
+    elif k == "order" and len(rest) >= 2 and rest[1] in DOLL_ORDERS:
+        if rest[1] in ("target", "follow"):
+            who = " ".join(rest[2:]).strip()
+            if not PLAYER_RE.match(who):
+                raise Fail("a player's name", "usage", "order %s <name>" % rest[1])
+            doll_order(n, "order %s %s" % (rest[1], who))
+        else:
+            doll_order(n, "order %s" % rest[1])
+        set_doll_keys(n, {"DOLL_ORDER": " ".join(rest[1:]).strip()})
+    elif k == "adapt" and len(rest) == 2 and rest[1] in ("on", "off"):
+        if not (was and rest[1] == "on"):                 # (one that follows the virtual dolls keeps it off: kept for later)
+            doll_order(n, "adapt %s" % rest[1])
+        set_doll_keys(n, {"DOLL_ADAPT": "1" if rest[1] == "on" else "0"})
+    elif k == "aim" and len(rest) == 2:
+        # (v150-host beta 18) direct: the doll turns its view at a virtual doll's speed; pad: through the stick (the default)
+        a = doll_aim_arg(rest[1])
+        doll_order(n, "aim %s" % a)
+        set_doll_keys(n, {"DOLL_AIM": a})
+    elif k == "leave":
+        doll_order(n, "leave")
+    else:
+        raise Fail("unknown order " + " ".join(rest), "usage", cmd_doll_order.__doc__.split("\n")[0])
+    return {"ok": True, "doll": doll_summary(n)}
+
+
+def cmd_doll_all(args):
+    """doll-all <bot> adapt <on|off> | difficulty <1-10|vdoll> | aim <direct|pad>: every doll of a bot's game, live and kept.
+    (v150-host beta 16) difficulty vdoll: each one at the level of the bot's virtual dolls (its place in VDOLL_LEVEL), the live
+    level off. (v150-host beta 18) aim: direct or pad (DOLL_AIM)."""
+    usage = "doll-all <bot> adapt on|off | difficulty 1-10|vdoll | aim direct|pad"
+    if len(args) != 3 or not args[0].isdigit() or not 1 <= int(args[0]) <= MAX_BOTS:
+        raise Fail(usage, "usage", usage)
+    b, k, v = int(args[0]), args[1], args[2]
+    if k == "adapt" and v in ("on", "off"):
+        keys = {"DOLL_ADAPT": "1" if v == "on" else "0"}
+    elif k == "difficulty" and (v in DOLL_LEVELS or v == "vdoll"):
+        keys = {"DOLL_DIFFICULTY": v}
+    elif k == "aim":
+        v = doll_aim_arg(v)
+        keys = {"DOLL_AIM": v}
+    else:
+        raise Fail(usage, "usage", usage)
+    for n in dolls():
+        kv = read_kv(doll_env(n))
+        if doll_bot(n) == b:
+            was = follows(kv)
+            set_doll_keys(n, keys)
+            if k == "difficulty":
+                difficulty_orders(n, dict(kv, **keys), was)
+            elif k == "aim":
+                doll_order(n, "aim %s" % v)
+            elif not (was and v == "on"):                 # (one that follows the virtual dolls keeps its live level off)
+                doll_order(n, "adapt %s" % v)
+    return cmd_dolls()
+
+
+VDOLL_MAX = 15
+# their level (docs/VIRTUAL_DOLL.md 11): 1 to 10, or one a doll (the last for the rest), as mgo1host.sh checks it
+VDOLL_LEVEL_RE = re.compile(r"^([1-9]|10)(,([1-9]|10)){0,14}$")
+
+
+def vdoll_count_of(v):
+    """A VDOLL_COUNT as mgo1host.sh takes it: 0 to 15, else 0."""
+    v = str(v or "").strip()
+    return min(VDOLL_MAX, int(v)) if v.isdigit() else 0
+
+
+def vdoll_teams_of(v):
+    """A VDOLL_TEAMS as mgo1host.sh gives it to the game: its small letters and commas, else auto."""
+    return re.sub(r"[^a-z,]", "", str(v or "")) or "auto"
+
+
+VDOLL_WEAPONS = ("auto", "ak47", "xm16e1", "scorpion", "m37", "svd")
+
+
+def vdoll_weapons_of(v):
+    """(v150-host beta 15) a VDOLL_WEAPONS as mgo1host.sh gives it to the game: its known words, else auto."""
+    w = [x for x in re.sub(r"[^a-z0-9,]", "", str(v or "")).split(",") if x]
+    return ",".join(x if x in VDOLL_WEAPONS else "auto" for x in w) or "auto"
+
+
+def vdoll_level_of(v):
+    """A VDOLL_LEVEL as mgo1host.sh gives it to the game: valid, else the game's own 5."""
+    v = re.sub(r"\s", "", str(v or ""))
+    return v if VDOLL_LEVEL_RE.match(v) else "5"
+
+
+VDOLL_CONTROLS = ("direct", "player")
+
+
+def vdoll_controls_of(v):
+    """(v150-host beta 18) a VDOLL_CONTROLS as mgo1host.sh takes it: player, else direct (the default, as before)."""
+    return "player" if re.sub(r"[\s\"']", "", str(v or "")).lower() == "player" else "direct"
+
+
+def vdoll_bound_of(v, default):
+    """(v150-host beta 19) a VDOLL_ADAPT_MIN / VDOLL_ADAPT_MAX as mgo1host.sh takes it: 1 to 10 (leading zeros read as
+    decimal), else its default."""
+    v = re.sub(r"[\s\"']", "", str(v or ""))
+    return int(v) if re.match(r"^[0-9]{1,3}$", v) and 1 <= int(v) <= 10 else default
+
+
+def vdoll_adapt_of(kv):
+    """(v150-host beta 19) The virtual dolls' live level as mgo1host.sh gives it to the game from these keys (bot<N>.env, or
+    the running game's run/vdolls.env): (on, lowest, highest); on only with VDOLL_ADAPT=1, the bounds 1 and 10 by default,
+    swapped when the wrong way round."""
+    on = re.sub(r"[\s\"']", "", str(kv.get("VDOLL_ADAPT") or "")) == "1"
+    lo, hi = vdoll_bound_of(kv.get("VDOLL_ADAPT_MIN"), 1), vdoll_bound_of(kv.get("VDOLL_ADAPT_MAX"), 10)
+    return on, min(lo, hi), max(lo, hi)
+
+
+def vdoll_adapt_arg(v):
+    """vdoll-set's "adapt": true or false (also 1 / 0, "on" / "off", "true" / "false", "1" / "0"; null or "": off, the
+    default); else refused."""
+    if v in (None, ""):
+        return False
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, int) and v in (0, 1):
+        return bool(v)
+    if isinstance(v, str) and v.strip().lower() in ("1", "on", "true", "0", "off", "false"):
+        return v.strip().lower() in ("1", "on", "true")
+    raise Fail("adapt: true or false", "vdoll_adapt", json.dumps(v) if not isinstance(v, str) else v)
+
+
+def vdoll_bound_arg(key, v):
+    """vdoll-set's "adapt_min" / "adapt_max": 1 to 10 (a number or its digits); else refused."""
+    if isinstance(v, str) and v.strip() in DOLL_LEVELS:
+        v = int(v)
+    if isinstance(v, bool) or not isinstance(v, int) or not 1 <= v <= 10:
+        raise Fail("%s: 1 to 10" % key, "vdoll_adapt_level", key, json.dumps(v) if not isinstance(v, str) else v)
+    return v
+
+
+def vdoll_live_lines(text, count=None, adapt=None):
+    """(v150-host beta 19) The text of run/vdolls.live: its first line the count wanted (a game of beta 18 or older reads only
+    that number), then `adapt 0|1`, `adapt_min <n>`, `adapt_max <n>` when the live level is set (the game of beta 19 reads
+    them every 2 s). count None: the file's own count kept; adapt (on, lo, hi) None: the file's own lines after the count
+    kept."""
+    lines = (text or "").split("\n")
+    first, rest = lines[0].strip(), [x for x in lines[1:] if x.strip()]
+    if count is not None:
+        first = str(count)
+    if adapt is not None:
+        rest = ["adapt %d" % (1 if adapt[0] else 0), "adapt_min %d" % adapt[1], "adapt_max %d" % adapt[2]]
+    return "".join("%s\n" % x for x in [first] + rest)
+
+
+LEVELS_NOW_RE = re.compile(r" vdoll: levels now ((?:[0-9]+(?:\.[0-9]+)?[ ]+)+)\(set ([0-9,]+)\)")
+
+
+def vdoll_levels_now(b):
+    """(v150-host beta 19) The levels now of the virtual dolls in the game (`in_game` in the status), as the bot's game last
+    said them in the day's log (`vdoll: levels now 7.25 8.00 (set 10,10)`, at least every 60 s while the live level is on):
+    (levels now, the levels set they move from), both in the dolls' numbers' order; None when the game has not said them
+    since its last start (the launcher's start line) or turned the live level off since (`vdoll: level: fixed`), or the
+    day has no log. The file's end read backwards, 2 MB at most, never through a link."""
+    path = os.path.join(LOG_ROOT, "bot%d" % b, time.strftime("%Y-%m-%d", time.gmtime()) + ".log")
+    start = ("mgo1host: bot %d, UDP port " % b).encode()
+    try:
+        d, name = os.path.split(os.path.abspath(path))
+        dfd = dir_fd(d)
+        try:
+            fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dfd)
+        finally:
+            os.close(dfd)
+        with os.fdopen(fd, "rb") as f:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                return None
+            end = f.seek(0, 2)
+            tail, at = b"", end
+            while at > 0 and end - at < (2 << 20):
+                step = min(256 << 10, at)
+                at -= step
+                f.seek(at)
+                tail = f.read(step) + tail
+                lines = tail.split(b"\n")
+                if at > 0:
+                    lines = lines[1:]                          # (a line cut by the block's start: read with the next block)
+                for line in reversed(lines):
+                    if start in line or b" vdoll: level: fixed" in line:
+                        return None
+                    if b" vdoll: levels now " in line:
+                        m = LEVELS_NOW_RE.search(line.decode("utf-8", "replace"))
+                        if not m:
+                            return None
+                        now, set_ = [round(float(x), 2) for x in m.group(1).split()], [int(x) for x in m.group(2).split(",") if x]
+                        return now, set_ if len(set_) == len(now) else None
+    except (OSError, ValueError):
+        return None
+    return None
+
+
+def vdoll_level_arg(v):
+    """vdoll-set's "level": 1 to 10, "3,5,7" or [3, 5, 7] (one a doll, the last for the rest; 15 at most), as bot<N>.env
+    keeps it ("3,5,7"); else refused."""
+    items = v if isinstance(v, list) else [v] if isinstance(v, int) else str(v).split(",") if isinstance(v, str) else None
+    out = []
+    for x in items if items is not None else [None]:
+        if isinstance(x, str) and x.strip() in DOLL_LEVELS:
+            x = int(x)
+        if isinstance(x, bool) or not isinstance(x, int) or not 1 <= x <= 10:
+            out = None
+            break
+        out.append(x)
+    if not out or len(out) > VDOLL_MAX:
+        raise Fail("level: 1 to 10, or one a doll (3,5,7)", "vdoll_level", json.dumps(v) if not isinstance(v, str) else v)
+    return ",".join(str(x) for x in out)
+
+
+def vdoll_names_file(path):
+    """A names file as the game reads it: a name a line, the empty ones skipped, 15 characters at most."""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            return [x.strip()[:15] for x in f.read().splitlines() if x.strip()][:VDOLL_MAX]
+    except OSError:
+        return []
+
+
+def vdoll_each(count, teams, level, names, weapons="auto"):
+    """Each virtual doll's team, level, name and weapon as the game gives them (a list's last value for the rest, VDOLL<n>
+    unnamed)."""
+    t, lv, w = teams.split(","), level.split(","), weapons.split(",")
+    return [(t[min(i, len(t) - 1)] if t[min(i, len(t) - 1)] in ("red", "blue") else "auto", int(lv[min(i, len(lv) - 1)]),
+             names[i] if i < len(names) else "VDOLL%d" % (i + 1), w[min(i, len(w) - 1)]) for i in range(count)]
+
+
+def bot_vdolls(b):
+    """A bot's virtual dolls: its settings (count, teams, level, names), those its running game was given (mgo1host.sh's
+    run/vdolls.env, run/vdolls.names; None before a start of this version) and, from its status, those in its game now."""
+    kv = read_kv(bot_env(b))
+    count, teams, level = vdoll_count_of(kv.get("VDOLL_COUNT")), vdoll_teams_of(kv.get("VDOLL_TEAMS")), vdoll_level_of(kv.get("VDOLL_LEVEL"))
+    weapons = vdoll_weapons_of(kv.get("VDOLL_WEAPONS"))
+    controls = vdoll_controls_of(kv.get("VDOLL_CONTROLS"))   # (v150-host beta 18)
+    adapt, amin, amax = vdoll_adapt_of(kv)                    # (v150-host beta 19) the live level
+    names = vdoll_names_file(os.path.join(CONF, "bot%d.vdolls" % b))
+    run = os.path.join(bot_state(b), "run")
+    st, age = {}, None
+    try:
+        with open(os.path.join(run, "status.json")) as f:
+            st = json.load(f)
+        age = int(time.time() - os.path.getmtime(os.path.join(run, "status.json")))
+    except (OSError, ValueError):
+        st = {}
+    if not isinstance(st, dict):
+        st = {}
+    live = st.get("vdolls") if isinstance(st.get("vdolls"), list) else []
+    applied, pending = None, None
+    if os.path.isfile(os.path.join(run, "vdolls.env")):
+        akv = read_kv(os.path.join(run, "vdolls.env"))
+        applied = {"count": vdoll_count_of(akv.get("VDOLL_COUNT")), "teams": vdoll_teams_of(akv.get("VDOLL_TEAMS")),
+                   "level": vdoll_level_of(akv.get("VDOLL_LEVEL")), "names": vdoll_names_file(os.path.join(run, "vdolls.names"))}
+        if "VDOLL_WEAPONS" in akv:                             # (beta 15: a game started by this version)
+            applied["weapons"] = vdoll_weapons_of(akv.get("VDOLL_WEAPONS"))
+        if "VDOLL_CONTROLS" in akv:                            # (beta 18: a game started by this version; before it, direct)
+            applied["controls"] = vdoll_controls_of(akv.get("VDOLL_CONTROLS"))
+        if "VDOLL_ADAPT" in akv:                               # (beta 19: as the game has it now, vdoll-set changes it live)
+            applied["adapt"], applied["adapt_min"], applied["adapt_max"] = vdoll_adapt_of(akv)
+        pending = vdoll_each(count, teams, level, names, weapons) != vdoll_each(applied["count"], applied["teams"], applied["level"],
+                                                                               applied["names"], applied.get("weapons", weapons)) \
+            or (count > 0 and controls != applied.get("controls", "direct"))
+    res = {"bot": b, "count": count, "teams": teams, "level": level, "names": names, "weapons": weapons, "controls": controls,
+           "adapt": adapt, "adapt_min": amin, "adapt_max": amax,
+           "most": max(0, game_max_players(b) - 2), "set_in_game": st.get("vdolls_set"), "in_game": st.get("players_vdolls", 0), "live": live,
+           "status_age": age, "applied": applied, "pending": pending}
+    # (v150-host beta 19) each virtual doll's level now, when its running game has the live level on and has said them
+    # since its start (its last `vdoll: levels now ...` line); absent otherwise
+    if applied is not None and applied.get("adapt"):
+        now = vdoll_levels_now(b)
+        if now is not None:
+            res["levels_now"] = now[0]
+            if now[1] is not None:
+                res["levels_now_set"] = now[1]
+    return res
+
+
+def cmd_vdolls():
+    # (v150-host beta 18) this server takes vdoll-set's "controls": MGO1 Host shows CONTROLS only when it sees this;
+    # (beta 19) and "adapt", "adapt_min", "adapt_max": MGO1 Host offers the LIVE LEVEL only when it sees "vdoll_adapt"
+    return {"ok": True, "bots": [bot_vdolls(b) for b in bots()], "vdoll_controls": True, "vdoll_adapt": True}
+
+
+def cmd_vdoll_set(args):
+    """vdoll-set <bot> [--restart]: the bot's virtual dolls from {"count", "teams", "level", "names"} on stdin (a key left out
+    kept)."""
+    global BOT
+    restart = "--restart" in args
+    args = [a for a in args if a != "--restart"]
+    if len(args) != 1 or not args[0].isdigit():
+        raise Fail("vdoll-set <bot> [--restart]", "usage", "vdoll-set <bot> [--restart]")
+    b = int(args[0])
+    if b not in bots():
+        raise Fail("no bot %d on this server" % b, "no_bot", b, ", ".join(map(str, bots())) or "-")
+    BOT = b
+    try:
+        d = json.loads(sys.stdin.read() or "{}")
+    except ValueError:
+        raise Fail("the settings are not JSON", "bad_json")
+    if not isinstance(d, dict):
+        raise Fail("the settings are not a JSON object", "bad_json")
+    keys = {}
+    if "count" in d:
+        most = min(VDOLL_MAX, max(0, game_max_players(b) - 2))  # (the host's entry, a seat kept for a real player)
+        n = d["count"]
+        if isinstance(n, str) and n.strip().isdigit():
+            n = int(n)
+        if isinstance(n, bool) or not isinstance(n, int) or n < 0 or n > most:
+            raise Fail("bot %d: %d virtual dolls at most (its players less the host and a kept seat)" % (b, most), "vdoll_count", b, most)
+        keys["VDOLL_COUNT"] = str(n)
+    if "teams" in d:
+        t = str(d["teams"] or "auto").strip().lower().replace(" ", "")
+        if not t or any(x not in ("red", "blue", "auto") for x in t.split(",")) or len(t.split(",")) > VDOLL_MAX:
+            raise Fail("teams: red, blue or auto, comma separated", "vdoll_teams", t)
+        keys["VDOLL_TEAMS"] = t
+    if "level" in d:
+        keys["VDOLL_LEVEL"] = vdoll_level_arg(5 if d["level"] in (None, "") else d["level"])
+    if "weapons" in d:                                         # (beta 15) auto, ak47, xm16e1, scorpion, m37, svd: one a doll
+        w = str(d["weapons"] or "auto").strip().lower().replace(" ", "").replace("-", "")
+        if not w or any(x not in VDOLL_WEAPONS for x in w.split(",")) or len(w.split(",")) > VDOLL_MAX:
+            raise Fail("weapons: auto, ak47, xm16e1, scorpion, m37 or svd, comma separated", "vdoll_weapons", w)
+        keys["VDOLL_WEAPONS"] = w
+    if "controls" in d:                                        # (beta 18) player or direct (null or "": direct, the default)
+        c = d["controls"]
+        c = "direct" if c in (None, "") else c.strip().lower() if isinstance(c, str) else c
+        if c not in VDOLL_CONTROLS:
+            raise Fail("controls: player or direct", "vdoll_controls", json.dumps(d["controls"]) if not isinstance(d["controls"], str) else d["controls"])
+        keys["VDOLL_CONTROLS"] = c
+    # (beta 19) the live level: "adapt" true or false, its bounds "adapt_min", "adapt_max" 1 to 10 (the bound not given kept,
+    # the lower first); the running game takes them at once (run/vdolls.live), its next games from bot<N>.env
+    if "adapt" in d:
+        keys["VDOLL_ADAPT"] = "1" if vdoll_adapt_arg(d["adapt"]) else "0"
+    if "adapt_min" in d or "adapt_max" in d:
+        _, amin, amax = vdoll_adapt_of(read_kv(bot_env(b)))
+        amin = vdoll_bound_arg("adapt_min", d["adapt_min"]) if "adapt_min" in d else amin
+        amax = vdoll_bound_arg("adapt_max", d["adapt_max"]) if "adapt_max" in d else amax
+        keys["VDOLL_ADAPT_MIN"], keys["VDOLL_ADAPT_MAX"] = str(min(amin, amax)), str(max(amin, amax))
+    names = None
+    if "names" in d:
+        names = d["names"] or []
+        if not isinstance(names, list) or len(names) > VDOLL_MAX:
+            raise Fail("names: a list of 15 names at most", "vdoll_names")
+        seen = set()
+        for x in names:
+            x = str(x)
+            if not DOLL_NAME_RE.match(x) or "  " in x or DOLL_DEFAULT_RE.match(x):
+                raise Fail("a virtual doll's name: 3 to 15 letters, digits, spaces and . _ - ! ? + *", "doll_name", x)
+            if x.upper() in seen:
+                raise Fail("two virtual dolls of the same name", "vdoll_name_taken", x)
+            seen.add(x.upper())
+    # (every key checked before anything is written)
+    if names is not None:
+        write_atomic(os.path.join(CONF, "bot%d.vdolls" % b), "".join("%s\n" % str(x) for x in names), 0o644)
+    if keys:
+        set_env_keys(keys, bot_env(b))
+    if "VDOLL_LEVEL" in keys:                              # (v150-host beta 16) its playable dolls that follow it: live
+        follow_sync(b)                                     # ((beta 19) the level SET, never the live level's level now)
+    adapt_live = None
+    if any(k in keys for k in ("VDOLL_ADAPT", "VDOLL_ADAPT_MIN", "VDOLL_ADAPT_MAX")) and not restart:
+        adapt_live = vdoll_adapt_live(b)
+    note("admin", do="vdoll-set", bot=b, count=keys.get("VDOLL_COUNT"), teams=keys.get("VDOLL_TEAMS"), level=keys.get("VDOLL_LEVEL"), weapons=keys.get("VDOLL_WEAPONS"),
+         controls=keys.get("VDOLL_CONTROLS"), adapt=keys.get("VDOLL_ADAPT"), adapt_min=keys.get("VDOLL_ADAPT_MIN"), adapt_max=keys.get("VDOLL_ADAPT_MAX"),
+         restart=restart)
+    res = {"ok": True, "vdolls": bot_vdolls(b), "takes_effect": "now" if restart else "next game", "vdoll_controls": True, "vdoll_adapt": True}
+    if adapt_live is not None:                             # (beta 19) the live level's keys: "now" when the running game took them
+        res["adapt_takes_effect"] = "now" if adapt_live else "next game"
+    if restart:
+        res["restart"] = cmd_restart(noted=False)
+    return res
+
+
+def vdoll_adapt_live(b):
+    """(v150-host beta 19) The bot's live level as bot<N>.env now has it told to its running game: the lines after the count
+    in run/vdolls.live (the game reads them within 2 s) and the run's vdolls.env (what the game has: vdolls' "applied").
+    True when the running game was started by a launcher that gives the live file; False: none (its next start reads
+    bot<N>.env)."""
+    run = os.path.join(bot_state(b), "run")
+    live = os.path.join(run, "vdolls.live")
+    if not os.path.isfile(live):
+        return False
+    adapt = vdoll_adapt_of(read_kv(bot_env(b)))
+    write_atomic(live, vdoll_live_lines(safe_read(live, 4096), adapt=adapt), 0o644)
+    if os.path.isfile(os.path.join(run, "vdolls.env")):
+        akv = read_kv(os.path.join(run, "vdolls.env"))
+        akv["VDOLL_ADAPT"], akv["VDOLL_ADAPT_MIN"], akv["VDOLL_ADAPT_MAX"] = "1" if adapt[0] else "0", str(adapt[1]), str(adapt[2])
+        write_atomic(os.path.join(run, "vdolls.env"), "".join("%s=%s\n" % kv for kv in akv.items()), 0o644)
+    return True
+
+
+def cmd_vdoll_count(args):
+    """vdoll-count <bot> <n>: the bot's virtual dolls wanted now (its running game reads run/vdolls.live every 2 s) and in
+    its next games (VDOLL_COUNT)."""
+    global BOT
+    if len(args) != 2 or not args[0].isdigit() or not args[1].isdigit():
+        raise Fail("vdoll-count <bot> <n>", "usage", "vdoll-count <bot> <n>")
+    b, n = int(args[0]), int(args[1])
+    if b not in bots():
+        raise Fail("no bot %d on this server" % b, "no_bot", b, ", ".join(map(str, bots())) or "-")
+    BOT = b
+    most = min(VDOLL_MAX, max(0, game_max_players(b) - 2))
+    if n > most:
+        raise Fail("bot %d: %d virtual dolls at most (its players less the host and a kept seat)" % (b, most), "vdoll_count", b, most)
+    set_env_keys({"VDOLL_COUNT": str(n)}, bot_env(b))
+    run = os.path.join(bot_state(b), "run")
+    live = False
+    if os.path.isfile(os.path.join(run, "vdolls.live")):  # (a game started by this version: it takes the count at once)
+        # ((beta 19) the live level's lines after the count kept)
+        write_atomic(os.path.join(run, "vdolls.live"), vdoll_live_lines(safe_read(os.path.join(run, "vdolls.live"), 4096), count=n), 0o644)
+        if os.path.isfile(os.path.join(run, "vdolls.env")):
+            akv = read_kv(os.path.join(run, "vdolls.env"))
+            akv["VDOLL_COUNT"] = str(n)
+            write_atomic(os.path.join(run, "vdolls.env"), "".join("%s=%s\n" % kv for kv in akv.items()), 0o644)
+        live = True
+    note("admin", do="vdoll-count", bot=b, count=n, live=live)
+    return {"ok": True, "vdolls": bot_vdolls(b), "takes_effect": "now" if live else "next game"}
+
+
+def cmd_doll_list(args):
+    """(v141 beta 3) how TX-55's game list shows the accountless dolls (server.env DOLL_LIST: host, own, off); each bot's
+    game takes it at its next start (mgo1host.sh), the manager at once (a seat kept while listed)."""
+    if not args or args[0] not in ("off", "own", "host"):
+        raise Fail("doll-list off|own|host", "usage", "doll-list off|own|host")
+    set_env_keys({"DOLL_LIST": args[0]}, SERVER_ENV, 0o644)
+    return cmd_dolls()
+
+
+def cmd_host_unranked(args):
+    """(v141 beta 7) SaveMGO's rankings and the dolls (server.env HOST_UNRANKED: auto, always, off); each bot's game takes it
+    at its next start (mgo1host.sh), the game now running keeps its own."""
+    if len(args) != 1 or args[0] not in ("auto", "always", "off"):
+        raise Fail("host-unranked auto|always|off", "usage", "host-unranked auto|always|off")
+    set_env_keys({"HOST_UNRANKED": args[0]}, SERVER_ENV, 0o644)
+    note("admin", do="host-unranked", a=args[0])
+    return cmd_dolls()
+
+
+def cmd_doll_keep_seat(args):
+    if not args or args[0] not in ("on", "off"):
+        raise Fail("doll-keep-seat on|off", "usage", "doll-keep-seat on|off")
+    set_env_keys({"DOLL_KEEP_SEAT": "1" if args[0] == "on" else "0"}, SERVER_ENV, 0o644)   # (server.env: the manager's)
+    systemctl("restart", "mgo1doll-manager")
+    return cmd_dolls()
+
+
+# (v150-host beta 16) the commands that write settings: one at a time (each reads a file, changes its keys and writes it
+# back: two at once lost the first one's keys), the others wait their turn
+WRITES = {"settings-set", "account-set", "servers-set", "schedule-set", "host-list-9", "host-unranked", "bot-add", "bot-remove", "bot-port",
+          "doll-set", "doll-remove", "doll-order", "doll-all", "doll-count", "doll-keep-seat", "doll-list", "vdoll-set", "vdoll-count",
+          "blacklist-add", "blacklist-remove", "whitelist-add", "whitelist-remove", "whitelist-only", "ban", "unban"}
+LOCK = None                                                  # (held to this call's end)
+
+
+def writers_turn():
+    """This call's turn among the commands that write: the lock /etc/mgo1host/.agent.lock, waited for MGO1_AGENT_LOCK_WAIT
+    seconds at most (150: another call may be adding dolls or starting a game again), then refused (busy)."""
+    global LOCK
+    import fcntl
+    try:
+        LOCK = open(os.path.join(CONF, ".agent.lock"), "a")
+    except OSError:
+        return                                               # (no settings folder yet: nothing to share)
+    end = time.time() + float(os.environ.get("MGO1_AGENT_LOCK_WAIT", "150"))
+    while True:
+        try:
+            fcntl.flock(LOCK, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return
+        except OSError:
+            if time.time() >= end:
+                raise Fail("another command is still writing this server's settings", "busy")
+            time.sleep(0.05)
+
+
+def main(argv):
+    global BOT
+    try:
+        os.nice(5)                                   # (v141 beta 4) the games first: the agent waits a little when busy
+    except OSError:
+        pass
+    if "--bot" in argv:
+        i = argv.index("--bot")
+        if i + 1 >= len(argv) or not argv[i + 1].isdigit() or not 1 <= int(argv[i + 1]) <= MAX_BOTS:
+            raise Fail("--bot 1 to %d" % MAX_BOTS, "usage", "--bot 1 to %d" % MAX_BOTS)
+        BOT = int(argv[i + 1])
+        argv = argv[:i] + argv[i + 2:]
+    if not argv:
+        raise Fail("a command: see mgo1host-agent's first lines", "usage", "mgo1host-agent")
+    c, args = argv[0], argv[1:]
+    if c in WRITES:
+        writers_turn()
+    simple = {
+        "version": lambda: {"ok": True, "agent": AGENT_VERSION, "bots": bots()},
+        "sysinfo": cmd_sysinfo, "bots": cmd_bots, "firewall": cmd_firewall,
+        "restart": cmd_restart, "settings-get": cmd_settings_get, "account-get": cmd_account_get,
+        "account-set": cmd_account_set, "schedule-get": lambda: {"ok": True, "schedule": schedule_now()},
+        "scheduled-restart": cmd_scheduled_restart, "servers-get": cmd_servers_get, "redact": cmd_redact,
+        "dolls": cmd_dolls, "vdolls": cmd_vdolls,
+    }
+    if c in simple:
+        return simple[c]()
+    if c == "status":
+        need_bot()
+        res, prev = status()
+        time.sleep(0.5)
+        res2, _ = status(prev)
+        return res2
+    with_args = {
+        "watch": cmd_watch, "log": cmd_log, "events": cmd_events, "install-check": cmd_install_check, "kick": cmd_kick,
+        "bot-add": cmd_bot_add, "bot-remove": cmd_bot_remove, "bot-port": cmd_bot_port,
+        "settings-set": cmd_settings_set, "schedule-set": cmd_schedule_set, "servers-set": cmd_servers_set,
+        "doll-set": cmd_doll_set, "doll-remove": cmd_doll_remove, "doll-order": cmd_doll_order, "doll-keep-seat": cmd_doll_keep_seat, "doll-list": cmd_doll_list,
+        "doll-all": cmd_doll_all, "doll-count": cmd_doll_count, "vdoll-set": cmd_vdoll_set, "vdoll-count": cmd_vdoll_count,
+        "logs": cmd_logs, "host-list-9": cmd_host_list_9, "host-unranked": cmd_host_unranked,
+    }
+    with_args.update({"logs": cmd_logs_view, "crashes": cmd_crashes, "crash": cmd_crash})   # (v150-host beta 16)
+    if c in with_args:
+        return with_args[c](args)
+    aliases = {"ban": "blacklist-add", "unban": "blacklist-remove", "bans": "lists"}
+    c = aliases.get(c, c)
+    if c in ("lists", "blacklist-add", "blacklist-remove", "whitelist-add", "whitelist-remove", "whitelist-only"):
+        return cmd_lists(c, args)
+    if c in ("stop", "start"):
+        return cmd_service(c)
+    raise Fail("unknown command " + c, "unknown_cmd", c)
+
+
+if __name__ == "__main__":
+    try:
+        r = main(sys.argv[1:])
+        if r is not None:
+            out(r)
+    except Fail as e:
+        out({"ok": False, "error": str(e), "code": e.code, "args": e.args_})
+        sys.exit(1)
+    except BrokenPipeError:
+        sys.exit(0)
+    except KeyboardInterrupt:
+        sys.exit(0)
+    except Exception as e:  # noqa: BLE001 - any other error: one line for MGO1 Host.exe, the log-in data masked
+        text = "%s: %s" % (type(e).__name__, e)
+        try:
+            text = redact(text, secrets())
+        except Exception:  # noqa: BLE001
+            pass
+        text = text.replace("\n", " ").replace("|", " ")[:300]
+        out({"ok": False, "error": text, "code": "internal", "args": [text]})
+        sys.exit(1)

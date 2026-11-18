@@ -1,0 +1,32 @@
+[Unit]
+Description=SaveMGO MGO1 dedicated host, bot %i (the recompiled game, Host Only, headless)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=mgo1host
+Group=mgo1host
+Environment=BOT=%i HOME_DIR=/opt/mgo1host STATE_DIR=/var/lib/mgo1host/bot%i
+EnvironmentFile=-/etc/mgo1host/server.env
+EnvironmentFile=/etc/mgo1host/bot%i.env
+# (v150-host beta 16) after starts that ended early (no account, a disc file missing, a game dead in its first minutes)
+# mgo1host.sh writes when the next start may come (.next_start in the bot's folder, 600 s ahead at most): the wait is
+# here, the service "activating" meanwhile; a stop ends it at once. It was a start every 5 s for ever
+ExecStartPre=-/bin/sh -c 'f=$$STATE_DIR/.next_start; t=$$(cat "$$f" 2>/dev/null); rm -f "$$f"; case "$$t" in ""|*[!0-9]*) exit 0 ;; esac; w=$$((t - $$(date +%%s))); if [ "$$w" -gt 0 ] && [ "$$w" -le 600 ]; then sleep "$$w"; fi; exit 0'
+TimeoutStartSec=700
+ExecStart=/opt/mgo1host/mgo1host.sh
+# (v141 beta 4) the bots' games before the dolls' and the rest when the processor is short (mgo1host.slice), and the
+# last the kernel ends when the memory is short
+Slice=mgo1host.slice
+Nice=-5
+OOMScoreAdjust=-500
+# the game ends when its game is gone or on "mgo1hostctl -b %i restart": a new one after 5 s
+Restart=always
+RestartSec=5
+# the log: journalctl -u mgo1host@%i
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,11 @@
+# MGO1 Host: the program's strings, part 19 (v141: the rules TEAM SNEAKING and BASE CAPTURE, the PC maps).
+# Columns: key, en, fr, de, it, es, pt-BR, ru, ja, ko, zh-Hans, zh-Hant. No em dash anywhere.
+S19 = [
+("rule_5", "TEAM SNEAKING", "INFILTRATION PAR ÉQUIPE", "TEAM-SCHLEICHMISSION", "INFILTRAZIONE A SQUADRE", "MISIÓN FURTIVA EQUIPO", "INFILTRAÇÃO EM EQUIPE", "КОМАНДНОЕ ПРОНИКНОВЕНИЕ", "チームスニーキング", "팀 스니킹", "团队潜入", "團隊潛入"),
+("rule_6", "BASE CAPTURE", "CAPTURE DE BASES", "BASISEROBERUNG", "CONQUISTA DELLE BASI", "CAPTURA DE BASES", "CAPTURA DE BASES", "ЗАХВАТ БАЗ", "ベースキャプチャー", "기지 점령", "据点占领", "據點佔領"),
+("da_taking_base", "taking a base", "prend une base", "erobert eine Basis", "conquista una base", "toma una base", "tomando uma base", "захватывает базу", "拠点を占領中", "기지 점령 중", "正在占领据点", "正在佔領據點"),
+("da_holding_base", "holding a base", "tient une base", "hält eine Basis", "tiene una base", "mantiene una base", "segurando uma base", "удерживает базу", "拠点を確保中", "기지 사수 중", "正在守住据点", "正在守住據點"),
+("da_going_to_base", "going to a base", "va vers une base", "geht zu einer Basis", "va verso una base", "va hacia una base", "indo para uma base", "идёт к базе", "拠点へ移動中", "기지로 이동 중", "正在前往据点", "正在前往據點"),
+("il_maps", "PC maps (13 and up): %s, %s files", "Cartes PC (13 et plus) : %s, %s fichiers", "PC-Karten (ab 13): %s, %s Dateien", "Mappe PC (dalla 13): %s, %s file", "Mapas de PC (13 en adelante): %s, %s archivos", "Mapas de PC (13 em diante): %s, %s arquivos", "Карты ПК (13 и далее): %s, файлов: %s", "PCマップ（13以降）：%s、%s ファイル", "PC 맵 (13번 이후): %s, 파일 %s개", "PC 地图（13 及以后）：%s，%s 个文件", "PC 地圖（13 及以後）：%s，%s 個檔案"),
+("il_no_maps", "No PC maps folder near the disc: the host offers the twelve maps only", "Pas de dossier des cartes PC près du disque : l'hôte ne propose que les douze cartes", "Kein Ordner der PC-Karten neben der Disc: der Host bietet nur die zwölf Karten an", "Nessuna cartella delle mappe PC vicino al disco: l'host offre solo le dodici mappe", "No hay carpeta de mapas de PC junto al disco: el host solo ofrece los doce mapas", "Nenhuma pasta de mapas de PC perto do disco: o host oferece só os doze mapas", "Рядом с диском нет папки карт ПК: хост предлагает только двенадцать карт", "ディスクの近くにPCマップのフォルダーがありません：ホストは12マップのみ", "디스크 근처에 PC 맵 폴더가 없음: 호스트는 12개 맵만 제공", "光盘旁没有 PC 地图文件夹：主机只提供十二张地图", "光碟旁沒有 PC 地圖資料夾：主機只提供十二張地圖"),
+]

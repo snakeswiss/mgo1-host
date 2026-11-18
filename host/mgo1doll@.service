@@ -1,0 +1,22 @@
+[Unit]
+Description=SaveMGO MGO1 PLAYABLE DOLL %i (a player run by the server in one of its bots' games)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=mgo1host
+Group=mgo1host
+Environment=DOLL=%i HOME_DIR=/opt/mgo1host STATE_DIR=/var/lib/mgo1host/doll%i
+EnvironmentFile=-/etc/mgo1host/server.env
+EnvironmentFile=/etc/mgo1host/doll%i.env
+ExecStart=/opt/mgo1host/mgo1doll.sh
+# (v141 beta 4) after the bots' games when the processor is short (mgo1doll.slice), before them when the memory is
+Slice=mgo1doll.slice
+Nice=5
+OOMScoreAdjust=300
+# mgo1doll-manager starts and stops it (a seat free in its bot's game or not); started, it plays again after a failure
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal

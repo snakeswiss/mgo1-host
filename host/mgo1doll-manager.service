@@ -1,0 +1,17 @@
+[Unit]
+Description=SaveMGO MGO1 PLAYABLE DOLLs: started and stopped to their bots' free seats
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# root: it starts and stops the mgo1doll@ services; it never reads the dolls' accounts
+ExecStart=/usr/local/bin/mgo1doll-manager
+Nice=5
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

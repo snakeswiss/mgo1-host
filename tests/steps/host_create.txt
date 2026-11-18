@@ -1,0 +1,13 @@
+# Create Game with the settings the lobby (and MGO1_HOST_ONLY / MGO1_HOST_SETTINGS) gave: R1 on [Host Only] goes to [OK]
+[Quick Join]|Select a rule set=40@40
+[Join Game]|Select a game to join from=40@30
+[Create Game]|Create a game with you as Host=2000@30
+[Host Name]|Enter a name for the host=40@30
+[Password Lock]|Enter a password=40@30
+[Comment]|Enter a comment=40@30
+[Next]|Go to the next page=2000@30
+Please set the order of the rules=800@40
+[Host Only]|Host-Only=800@40
+[OK]|Create a game using=2000@30
+A game will be created|using=10@40
+=2000@30

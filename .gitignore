@@ -1,0 +1,13 @@
+build/
+out129/
+*.o
+*.exe
+*.bin
+__pycache__/
+MGO1Loader/obj/
+MGO1Loader/objO2/
+MGO1Loader/gen/
+hostpanel/deps
+out*/
+native/obj/
+/mgo1host-src.tar.gz

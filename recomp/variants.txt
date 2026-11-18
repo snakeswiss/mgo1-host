@@ -1,0 +1,197 @@
+# Instruction variants of the generated code, switched at run time by the platform (ps2::gVariant[id]).
+# page  address  kind  value  id
+#   page: a US page (and base), its sites moved to the other versions (recomp/mips2shape.py); <page>:<version>
+#   a site of that version's own, at its address, where the US one could not be moved
+#   word: the instruction word run instead while the variant is on
+#   after / before: a C++ statement run after / before the instruction while it is on
+# The ids:
+#   3  the fair rules: each change gives at 60 what the PS2 gives at 30 in a second; on only when
+#      a map asking for 30 runs at the engine's full rate (config.ini fps60_mode=1, measures:
+#      since v123 a match at 60 runs the PS2's own passes and needs none, docs/FPS60.md)
+#   4  the fair rules' motion marks: on while a 0x40 actor runs (the players), set by the
+#      platform at each actor's call (ps2world.cpp, the actor loop 0x1228C0), with 3
+#   5  the M37's pump: on in the native build (at 30 and 60), the platform's M37Fire / M37Pumped
+#      (docs/GAME_FIXES.md)
+#   6  the upstream bandwidth's choices up to 4096 kbps (ntmenu2, docs/GAME_FIXES.md): on in the native
+#      build, with the platform's bridges of the choices' kbps (0x377840, 0x377800) and of the setter
+#      (0x16EBA0)
+#
+# The same player code sits at other addresses in each map (tools/fps60_sites.py checks them):
+#   the stun recovery block S (n001a 0x41A4FC): each frame the stunned player gets
+#     (8 + the presses of the last 32 frames) x the stun maximum x C / 1 000 000
+#     S+0x68 addiu t7, t7, 1 counts a press of the 32-frame history (the byte 0xB77, from 8)
+#     S+0x88 sll t6, t2, 16 then sra 16: the maximum (0xB6A)
+#   the spread decay D (n001a 0x41D218): each frame the weapon's two spreads (0xDC, 0xDE) fall
+#     by the weapon's rate (its parameter +4) x the stance factor, D+0x5C / D+0x90 mul.s
+#   the camera's yaw step Y (n001a 0x3ED8A8) and its settings C (n001a 0x3EF1D0), in the match's
+#     camera NewParallelCameraLocal
+#   the motion mark checks M (n001a 0x318940: once when a motion's time passes 5 x a3) and M2
+#     (0x3189E0: while it is past), 471 and 109 calls in the players' code (moves, weapons)
+#   the P2P sender (base 0x172510): an actor that runs on the drawn half of a frame at 30 (it
+#     skips the half the skip mask 0x40 marks) and on every frame at 60, sending the player's
+#     records every 3 of its runs (0x172578 li t7, 3): 10 a second at 30, 20 at 60
+#
+# 3  fair spread: D's decrease halved (x 0.5 after each mul.s): the spread falls as fast per second
+#    at 60 frames as at 30
+# 3  fair stun: a press counts 2 (S+0x68 addiu 2) and the maximum is halved (S+0x88 sll 15):
+#    (8 + 2 presses) x max / 2 a frame; with the history's 32 frames lasting half as long at 60,
+#    the recovery per second is the PS2's
+# 3  fair camera: the camera's speed (its work + 0x70, set each frame by C: ROTATION SPEED x 0.125
+#    + 0.5; C+0x48 add.s) halved: the pitch and the turn toward the player's facing move per frame
+#    by the stick or the angle x the speed; the yaw (Y) keeps a part of its last step, delta =
+#    0.625 x the last + 341.33 x the stick / 128 x the speed: at 60 0.7906 (the square root of
+#    0.625, Y+0x28) and 190.63 (Y+0x38) give the same turn per second and the same ramp
+# 4  fair motion marks: a player (a 0x40 actor) runs once a frame at 30 with the step 10, the
+#    motion's time moved by 5 each half: its k-th frame sees 10 k - 5; at 60 its j-th frame sees
+#    5 j. A mark 5 x a3 passes at 30 on the frame ceil((a3 + 1) / 2), at 60 on the frame a3: the
+#    automatic weapons fire every 3 frames at 30 (100 ms, a3 4 and 5) and every 4 or 5 at 60
+#    (67 and 83 ms). At 60 a3 becomes 2 x floor(a3 / 2) + 2 at the entry of M and M2: every mark
+#    of the players' moves and weapons at the time it has at 30
+# 5  M37: the fire state's shot request (li t6, 2) goes through M37Fire (0 while the local
+#    player's last M37 shot has not finished its pump: the weapon changed during it), the
+#    M37's fired state ending its pump (sb t7, 0x4A(s1): state 1) calls M37Pumped
+# 3  fair P2P: at 60 the sender waits 6 of its runs (0x240F0006): 10 sends a second as a PS2 in a
+#    match (the lobby runs at 60 on both and is not changed)
+n001a  0x41d274  after  c.f[0] *= 0.5f;  3
+n001a  0x41d2a8  after  c.f[0] *= 0.5f;  3
+n001a  0x41a564  word  0x25ef0002  3
+n001a  0x41a584  word  0x000a73c0  3
+n001a  0x3ef218  after  c.f[0] *= 0.5f;  3
+n001a  0x3ed8d0  after  c.f[1] = 0.7905694f;  3
+n001a  0x3ed8e0  after  c.f[1] = 190.62843f;  3
+n001a  0x318940  before  c.r[7] = 2 * (c.r[7] / 2) + 2;  4
+n001a  0x3189e0  before  c.r[7] = 2 * (c.r[7] / 2) + 2;  4
+n001a  0x41e45c  after  { extern uint64_t M37Fire(uint32_t, uint32_t, uint64_t); c.r[14] = M37Fire((uint32_t)c.r[18], (uint32_t)c.r[17], c.r[14]); }  5
+n001a  0x41e9e0  after  { extern void M37Pumped(uint32_t); M37Pumped((uint32_t)c.r[18]); }  5
+n002a  0x4191c4  after  c.f[0] *= 0.5f;  3
+n002a  0x4191f8  after  c.f[0] *= 0.5f;  3
+n002a  0x4164b4  word  0x25ef0002  3
+n002a  0x4164d4  word  0x000a73c0  3
+n002a  0x3e8c40  after  c.f[0] *= 0.5f;  3
+n002a  0x3e72f8  after  c.f[1] = 0.7905694f;  3
+n002a  0x3e7308  after  c.f[1] = 190.62843f;  3
+n002a  0x318e20  before  c.r[7] = 2 * (c.r[7] / 2) + 2;  4
+n002a  0x318ec0  before  c.r[7] = 2 * (c.r[7] / 2) + 2;  4
+n002a  0x41a3ac  after  { extern uint64_t M37Fire(uint32_t, uint32_t, uint64_t); c.r[14] = M37Fire((uint32_t)c.r[18], (uint32_t)c.r[17], c.r[14]); }  5
+n002a  0x41a930  after  { extern void M37Pumped(uint32_t); M37Pumped((uint32_t)c.r[18]); }  5
+n003a  0x4173d4  after  c.f[0] *= 0.5f;  3
+n003a  0x417408  after  c.f[0] *= 0.5f;  3
+n003a  0x4146c4  word  0x25ef0002  3
+n003a  0x4146e4  word  0x000a73c0  3
+n003a  0x3e6e50  after  c.f[0] *= 0.5f;  3
+n003a  0x3e5508  after  c.f[1] = 0.7905694f;  3
+n003a  0x3e5518  after  c.f[1] = 190.62843f;  3
+n003a  0x318e20  before  c.r[7] = 2 * (c.r[7] / 2) + 2;  4
+n003a  0x318ec0  before  c.r[7] = 2 * (c.r[7] / 2) + 2;  4
+n003a  0x4185bc  after  { extern uint64_t M37Fire(uint32_t, uint32_t, uint64_t); c.r[14] = M37Fire((uint32_t)c.r[18], (uint32_t)c.r[17], c.r[14]); }  5
+n003a  0x418b40  after  { extern void M37Pumped(uint32_t); M37Pumped((uint32_t)c.r[18]); }  5
+n011a  0x40fba4  after  c.f[0] *= 0.5f;  3
+n011a  0x40fbd8  after  c.f[0] *= 0.5f;  3
+n011a  0x40ce94  word  0x25ef0002  3
+n011a  0x40ceb4  word  0x000a73c0  3
+n011a  0x3e25d0  after  c.f[0] *= 0.5f;  3
+n011a  0x3e0c88  after  c.f[1] = 0.7905694f;  3
+n011a  0x3e0c98  after  c.f[1] = 190.62843f;  3
+n011a  0x3186c0  before  c.r[7] = 2 * (c.r[7] / 2) + 2;  4
+n011a  0x318760  before  c.r[7] = 2 * (c.r[7] / 2) + 2;  4
+n011a  0x410d8c  after  { extern uint64_t M37Fire(uint32_t, uint32_t, uint64_t); c.r[14] = M37Fire((uint32_t)c.r[18], (uint32_t)c.r[17], c.r[14]); }  5
+n011a  0x411310  after  { extern void M37Pumped(uint32_t); M37Pumped((uint32_t)c.r[18]); }  5
+n012a  0x406664  after  c.f[0] *= 0.5f;  3
+n012a  0x406698  after  c.f[0] *= 0.5f;  3
+n012a  0x403954  word  0x25ef0002  3
+n012a  0x403974  word  0x000a73c0  3
+n012a  0x3d9090  after  c.f[0] *= 0.5f;  3
+n012a  0x3d7748  after  c.f[1] = 0.7905694f;  3
+n012a  0x3d7758  after  c.f[1] = 190.62843f;  3
+n012a  0x3184c0  before  c.r[7] = 2 * (c.r[7] / 2) + 2;  4
+n012a  0x318560  before  c.r[7] = 2 * (c.r[7] / 2) + 2;  4
+n012a  0x40784c  after  { extern uint64_t M37Fire(uint32_t, uint32_t, uint64_t); c.r[14] = M37Fire((uint32_t)c.r[18], (uint32_t)c.r[17], c.r[14]); }  5
+n012a  0x407dd0  after  { extern void M37Pumped(uint32_t); M37Pumped((uint32_t)c.r[18]); }  5
+n013a  0x3fe464  after  c.f[0] *= 0.5f;  3
+n013a  0x3fe498  after  c.f[0] *= 0.5f;  3
+n013a  0x3fb754  word  0x25ef0002  3
+n013a  0x3fb774  word  0x000a73c0  3
+n013a  0x3d0e90  after  c.f[0] *= 0.5f;  3
+n013a  0x3cf548  after  c.f[1] = 0.7905694f;  3
+n013a  0x3cf558  after  c.f[1] = 190.62843f;  3
+n013a  0x318540  before  c.r[7] = 2 * (c.r[7] / 2) + 2;  4
+n013a  0x3185e0  before  c.r[7] = 2 * (c.r[7] / 2) + 2;  4
+n013a  0x3ff64c  after  { extern uint64_t M37Fire(uint32_t, uint32_t, uint64_t); c.r[14] = M37Fire((uint32_t)c.r[18], (uint32_t)c.r[17], c.r[14]); }  5
+n013a  0x3ffbd0  after  { extern void M37Pumped(uint32_t); M37Pumped((uint32_t)c.r[18]); }  5
+n021a  0x417504  after  c.f[0] *= 0.5f;  3
+n021a  0x417538  after  c.f[0] *= 0.5f;  3
+n021a  0x4147f4  word  0x25ef0002  3
+n021a  0x414814  word  0x000a73c0  3
+n021a  0x3e4e20  after  c.f[0] *= 0.5f;  3
+n021a  0x3e34d8  after  c.f[1] = 0.7905694f;  3
+n021a  0x3e34e8  after  c.f[1] = 190.62843f;  3
+n021a  0x316710  before  c.r[7] = 2 * (c.r[7] / 2) + 2;  4
+n021a  0x3167b0  before  c.r[7] = 2 * (c.r[7] / 2) + 2;  4
+n021a  0x4186ec  after  { extern uint64_t M37Fire(uint32_t, uint32_t, uint64_t); c.r[14] = M37Fire((uint32_t)c.r[18], (uint32_t)c.r[17], c.r[14]); }  5
+n021a  0x418c70  after  { extern void M37Pumped(uint32_t); M37Pumped((uint32_t)c.r[18]); }  5
+n022a  0x40e19c  after  c.f[0] *= 0.5f;  3
+n022a  0x40e1d0  after  c.f[0] *= 0.5f;  3
+n022a  0x40b48c  word  0x25ef0002  3
+n022a  0x40b4ac  word  0x000a73c0  3
+n022a  0x3dd7b0  after  c.f[0] *= 0.5f;  3
+n022a  0x3dbe68  after  c.f[1] = 0.7905694f;  3
+n022a  0x3dbe78  after  c.f[1] = 190.62843f;  3
+n022a  0x3184a0  before  c.r[7] = 2 * (c.r[7] / 2) + 2;  4
+n022a  0x318540  before  c.r[7] = 2 * (c.r[7] / 2) + 2;  4
+n022a  0x40f384  after  { extern uint64_t M37Fire(uint32_t, uint32_t, uint64_t); c.r[14] = M37Fire((uint32_t)c.r[18], (uint32_t)c.r[17], c.r[14]); }  5
+n022a  0x40f908  after  { extern void M37Pumped(uint32_t); M37Pumped((uint32_t)c.r[18]); }  5
+n024a  0x419f7c  after  c.f[0] *= 0.5f;  3
+n024a  0x419fb0  after  c.f[0] *= 0.5f;  3
+n024a  0x41726c  word  0x25ef0002  3
+n024a  0x41728c  word  0x000a73c0  3
+n024a  0x3e7898  after  c.f[0] *= 0.5f;  3
+n024a  0x3e5f50  after  c.f[1] = 0.7905694f;  3
+n024a  0x3e5f60  after  c.f[1] = 190.62843f;  3
+n024a  0x317090  before  c.r[7] = 2 * (c.r[7] / 2) + 2;  4
+n024a  0x317130  before  c.r[7] = 2 * (c.r[7] / 2) + 2;  4
+n024a  0x41b164  after  { extern uint64_t M37Fire(uint32_t, uint32_t, uint64_t); c.r[14] = M37Fire((uint32_t)c.r[18], (uint32_t)c.r[17], c.r[14]); }  5
+n024a  0x41b6e8  after  { extern void M37Pumped(uint32_t); M37Pumped((uint32_t)c.r[18]); }  5
+n031a  0x412a5c  after  c.f[0] *= 0.5f;  3
+n031a  0x412a90  after  c.f[0] *= 0.5f;  3
+n031a  0x40fd4c  word  0x25ef0002  3
+n031a  0x40fd6c  word  0x000a73c0  3
+n031a  0x3e5488  after  c.f[0] *= 0.5f;  3
+n031a  0x3e3b40  after  c.f[1] = 0.7905694f;  3
+n031a  0x3e3b50  after  c.f[1] = 190.62843f;  3
+n031a  0x318b20  before  c.r[7] = 2 * (c.r[7] / 2) + 2;  4
+n031a  0x318bc0  before  c.r[7] = 2 * (c.r[7] / 2) + 2;  4
+n031a  0x413c44  after  { extern uint64_t M37Fire(uint32_t, uint32_t, uint64_t); c.r[14] = M37Fire((uint32_t)c.r[18], (uint32_t)c.r[17], c.r[14]); }  5
+n031a  0x4141c8  after  { extern void M37Pumped(uint32_t); M37Pumped((uint32_t)c.r[18]); }  5
+n032a  0x414acc  after  c.f[0] *= 0.5f;  3
+n032a  0x414b00  after  c.f[0] *= 0.5f;  3
+n032a  0x411dbc  word  0x25ef0002  3
+n032a  0x411ddc  word  0x000a73c0  3
+n032a  0x3e74f8  after  c.f[0] *= 0.5f;  3
+n032a  0x3e5bb0  after  c.f[1] = 0.7905694f;  3
+n032a  0x3e5bc0  after  c.f[1] = 190.62843f;  3
+n032a  0x318c20  before  c.r[7] = 2 * (c.r[7] / 2) + 2;  4
+n032a  0x318cc0  before  c.r[7] = 2 * (c.r[7] / 2) + 2;  4
+n032a  0x415cb4  after  { extern uint64_t M37Fire(uint32_t, uint32_t, uint64_t); c.r[14] = M37Fire((uint32_t)c.r[18], (uint32_t)c.r[17], c.r[14]); }  5
+n032a  0x416238  after  { extern void M37Pumped(uint32_t); M37Pumped((uint32_t)c.r[18]); }  5
+n033a  0x40ba8c  after  c.f[0] *= 0.5f;  3
+n033a  0x40bac0  after  c.f[0] *= 0.5f;  3
+n033a  0x408d7c  word  0x25ef0002  3
+n033a  0x408d9c  word  0x000a73c0  3
+n033a  0x3de4b8  after  c.f[0] *= 0.5f;  3
+n033a  0x3dcb70  after  c.f[1] = 0.7905694f;  3
+n033a  0x3dcb80  after  c.f[1] = 190.62843f;  3
+n033a  0x318aa0  before  c.r[7] = 2 * (c.r[7] / 2) + 2;  4
+n033a  0x318b40  before  c.r[7] = 2 * (c.r[7] / 2) + 2;  4
+n033a  0x40cc74  after  { extern uint64_t M37Fire(uint32_t, uint32_t, uint64_t); c.r[14] = M37Fire((uint32_t)c.r[18], (uint32_t)c.r[17], c.r[14]); }  5
+n033a  0x40d1f8  after  { extern void M37Pumped(uint32_t); M37Pumped((uint32_t)c.r[18]); }  5
+base  0x172578  word  0x240f0006  3
+# 6  upstream: the first-time network settings (0x34C230) set 4096 kbps instead of 256 (0x34C298 li t6,
+#    0x100); the saved ones (0x34AC08) with the game's 256 are raised to 4096 (UpstreamSaved, on the
+#    settings read at s0 + 0x219C, the upstream at + 0xA); the display (0x3760A0) writes OR GREATER after
+#    the last choice, 7, instead of 4 (0x376418, 0x3764A8 li t7, 4: the Japanese and the other languages)
+ntmenu2  0x34c298  word  0x240e1000  6
+ntmenu2  0x34ac8c  before  { extern void UpstreamSaved(uint32_t); UpstreamSaved((uint32_t)c.r[16] + 0x219c); }  6
+ntmenu2  0x376418  word  0x240f0007  6
+ntmenu2  0x3764a8  word  0x240f0007  6
+# the European program's first-time default (its 0x34C298: li t7, 0x100 at 0x34CC20)
+ntmenu2:EU  0x34cc20  word  0x240f1000  6
